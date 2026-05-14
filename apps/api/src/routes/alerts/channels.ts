@@ -544,11 +544,38 @@ channelsRoutes.post(
           }
           break;
 
-        default:
-          testResult = {
-            success: false,
-            message: `Unknown channel type: ${channel.type}`
-          };
+        default: {
+          // Compile-time exhaustiveness: if a new enum value is added without
+          // a case above, TS errors here. Runtime 501 covers the deploy-drift
+          // case where the DB enum has a value the code does not handle yet.
+          const _exhaustiveCheck: never = channel.type;
+          void _exhaustiveCheck;
+          const unsupportedType = (channel as { type: string }).type;
+          console.error(
+            '[Channels] Test endpoint missing handler for channel type',
+            { channelId: channel.id, type: unsupportedType }
+          );
+          writeRouteAudit(c, {
+            orgId: channel.orgId,
+            action: 'notification_channel.test',
+            resourceType: 'notification_channel',
+            resourceId: channel.id,
+            resourceName: channel.name,
+            details: {
+              success: false,
+              reason: 'unsupported_channel_type',
+              type: unsupportedType,
+            },
+            result: 'failure',
+          });
+          return c.json(
+            {
+              success: false,
+              error: `Test endpoint does not support channel type: ${unsupportedType}`
+            },
+            501
+          );
+        }
       }
     } catch (error) {
       testResult = {

@@ -16,8 +16,9 @@ import {
   XCircle
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import type { NotificationChannelType } from '@breeze/shared';
 
-export type NotificationChannelType = 'email' | 'slack' | 'teams' | 'pagerduty' | 'webhook' | 'sms' | 'pushover';
+export type { NotificationChannelType };
 
 export type NotificationChannel = {
   id: string;

@@ -1,4 +1,5 @@
 import { and, eq, inArray } from 'drizzle-orm';
+import type { NotificationChannelType } from '@breeze/shared';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
 import {
   alertRules,
@@ -173,7 +174,7 @@ export function containsNotificationBindingOverride(value: unknown) {
 }
 
 export function validateNotificationChannelConfig(
-  type: 'email' | 'slack' | 'teams' | 'webhook' | 'pagerduty' | 'sms' | 'pushover',
+  type: NotificationChannelType,
   config: unknown
 ): string[] {
   if (!isRecord(config)) {

@@ -6,6 +6,7 @@ import AlertsTabStrip from './AlertsTabStrip';
 import { fetchWithAuth } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
 import { navigateTo } from '@/lib/navigation';
+import { extractApiError } from '@/lib/apiError';
 
 type ModalMode = 'closed' | 'create' | 'edit' | 'delete';
 
@@ -39,10 +40,18 @@ export default function NotificationChannelsPage() {
   const fetchRoutingRules = useCallback(async () => {
     try {
       const response = await fetchWithAuth('/alerts/routing-rules');
-      if (!response.ok) return;
+      if (!response.ok) {
+        // Routing rules are a secondary panel; don't block the page. Log
+        // to console so failures are still debuggable.
+        const data = await response.json().catch(() => null);
+        console.warn('[NotificationChannelsPage]', extractApiError(data, `Failed to fetch routing rules (HTTP ${response.status})`));
+        return;
+      }
       const data = await response.json();
       setRoutingRules(data.rules ?? data.data ?? (Array.isArray(data) ? data : []));
-    } catch { /* non-critical */ }
+    } catch (err) {
+      console.warn('[NotificationChannelsPage] fetchRoutingRules', err);
+    }
   }, []);
 
   const fetchChannels = useCallback(async () => {
@@ -55,7 +64,8 @@ export default function NotificationChannelsPage() {
           void navigateTo('/login', { replace: true });
           return;
         }
-        throw new Error('Failed to fetch notification channels');
+        const data = await response.json().catch(() => null);
+        throw new Error(extractApiError(data, 'Failed to fetch notification channels'));
       }
       const data = await response.json();
       setChannels(data.channels ?? data.data ?? (Array.isArray(data) ? data : []));
@@ -97,7 +107,8 @@ export default function NotificationChannelsPage() {
           void navigateTo('/login', { replace: true });
           return;
         }
-        throw new Error('Test failed');
+        const data = await response.json().catch(() => null);
+        throw new Error(extractApiError(data, 'Test failed'));
       }
 
       // Refresh to update test status
@@ -290,8 +301,8 @@ export default function NotificationChannelsPage() {
           void navigateTo('/login', { replace: true });
           return;
         }
-        const data = await response.json();
-        throw new Error(data.error || 'Failed to save channel');
+        const data = await response.json().catch(() => null);
+        throw new Error(extractApiError(data, 'Failed to save channel'));
       }
 
       await fetchChannels();
@@ -317,7 +328,8 @@ export default function NotificationChannelsPage() {
           void navigateTo('/login', { replace: true });
           return;
         }
-        throw new Error('Failed to delete channel');
+        const data = await response.json().catch(() => null);
+        throw new Error(extractApiError(data, 'Failed to delete channel'));
       }
 
       await fetchChannels();
@@ -345,8 +357,8 @@ export default function NotificationChannelsPage() {
         }),
       });
       if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error || 'Failed to save routing rule');
+        const data = await response.json().catch(() => null);
+        throw new Error(extractApiError(data, 'Failed to save routing rule'));
       }
       await fetchRoutingRules();
       setShowRuleForm(false);
@@ -359,7 +371,10 @@ export default function NotificationChannelsPage() {
   const handleDeleteRoutingRule = async (ruleId: string) => {
     try {
       const response = await fetchWithAuth(`/alerts/routing-rules/${ruleId}`, { method: 'DELETE' });
-      if (!response.ok) throw new Error('Failed to delete routing rule');
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(extractApiError(data, 'Failed to delete routing rule'));
+      }
       await fetchRoutingRules();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete routing rule');
