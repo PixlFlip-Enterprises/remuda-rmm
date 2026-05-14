@@ -116,14 +116,14 @@ export const listChannelsSchema = z.object({
   page: z.string().optional(),
   limit: z.string().optional(),
   orgId: z.string().uuid().optional(),
-  type: z.enum(['email', 'slack', 'teams', 'webhook', 'pagerduty', 'sms']).optional(),
+  type: z.enum(['email', 'slack', 'teams', 'webhook', 'pagerduty', 'sms', 'pushover']).optional(),
   enabled: z.enum(['true', 'false']).optional()
 });
 
 export const createChannelSchema = z.object({
   orgId: z.string().uuid().optional(),
   name: z.string().min(1).max(255),
-  type: z.enum(['email', 'slack', 'teams', 'webhook', 'pagerduty', 'sms']),
+  type: z.enum(['email', 'slack', 'teams', 'webhook', 'pagerduty', 'sms', 'pushover']),
   config: z.record(z.unknown()), // JSONB for type-specific config
   enabled: z.boolean().default(true)
 });
