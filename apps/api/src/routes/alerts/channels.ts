@@ -40,6 +40,9 @@ const requireAlertRead = requirePermission(PERMISSIONS.ALERTS_READ.resource, PER
 const requireAlertWrite = requirePermission(PERMISSIONS.ALERTS_WRITE.resource, PERMISSIONS.ALERTS_WRITE.action);
 
 function toChannelResponse(channel: typeof notificationChannels.$inferSelect) {
+  // lastTestedAt and lastTestStatus are carried through via the ...channel spread;
+  // updatedAt is intentionally NOT bumped when persisting a test result — running
+  // a test is not a user content change, only lastTestedAt is the relevant timestamp.
   return {
     ...channel,
     config: redactNotificationChannelConfig(channel.type, channel.config),
@@ -568,6 +571,7 @@ channelsRoutes.post(
             },
             result: 'failure',
           });
+          // NOTE: unsupported channel type returns early; last_test_status is intentionally not persisted here (deploy-drift path, already covered by the audit log).
           return c.json(
             {
               success: false,
@@ -582,6 +586,20 @@ channelsRoutes.post(
         success: false,
         message: `Failed to test channel: ${error instanceof Error ? error.message : 'Unknown error'}`
       };
+    }
+
+    // Best-effort audit field — a DB hiccup here must not mask a successful
+    // (or completed) test send. The HTTP response reflects testResult, not this write.
+    // updatedAt is intentionally NOT bumped here; running a test is not a user content change.
+    try {
+      await db.update(notificationChannels)
+        .set({
+          lastTestedAt: new Date(),
+          lastTestStatus: testResult.success ? 'success' : 'failed',
+        })
+        .where(eq(notificationChannels.id, channel.id));
+    } catch (persistError) {
+      console.error('[Channels] Failed to persist test outcome', { channelId: channel.id, persistError });
     }
 
     const response = {

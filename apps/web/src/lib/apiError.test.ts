@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractApiError } from './apiError';
+import { extractApiError, isApiFailure } from './apiError';
 
 describe('extractApiError', () => {
   const FALLBACK = 'Operation failed';
@@ -93,5 +93,59 @@ describe('extractApiError', () => {
 
   it('prefers error over errorMessage when both exist', () => {
     expect(extractApiError({ error: 'real', errorMessage: 'legacy' }, FALLBACK)).toBe('real');
+  });
+});
+
+describe('isApiFailure', () => {
+  it('true when http status >= 400', () => {
+    expect(isApiFailure({}, 400)).toBe(true);
+    expect(isApiFailure({}, 500)).toBe(true);
+  });
+  it('true when body.success === false even on 200', () => {
+    expect(isApiFailure({ success: false, message: 'nope' }, 200)).toBe(true);
+  });
+  it('true when testResult.success === false on 200', () => {
+    expect(isApiFailure({ testResult: { success: false, message: 'bad token' } }, 200)).toBe(true);
+  });
+  it('false for a normal 200 success body', () => {
+    expect(isApiFailure({ data: [1, 2] }, 200)).toBe(false);
+    expect(isApiFailure({ success: true }, 200)).toBe(false);
+    expect(isApiFailure(null, 200)).toBe(false);
+  });
+
+  // CONTRACT: isApiFailure is deliberately a SHALLOW, top-level-only check.
+  // It must NOT recurse into nested/batch bodies — a partial-success aggregate
+  // (top-level success:true with per-item success:false entries) is NOT a
+  // request failure. If a future change makes this recurse ("catch nested
+  // failures"), every partial-success/batch endpoint routed through runAction
+  // would start throwing false errors. These assertions pin that contract so
+  // such a regression fails loudly here.
+  it('does NOT recurse: nested/batch success:false under a 200 success body is not a failure', () => {
+    expect(isApiFailure({ success: true, results: [{ success: false }, { success: true }] }, 200)).toBe(false);
+    expect(isApiFailure({ data: { success: false } }, 200)).toBe(false);
+    expect(isApiFailure({ items: [{ ok: false }], success: true }, 200)).toBe(false);
+    // testResult is only inspected at the top level, not nested under data.
+    expect(isApiFailure({ data: { testResult: { success: false } } }, 200)).toBe(false);
+  });
+
+  it('still flags genuine top-level failure shapes (the only ones it should)', () => {
+    expect(isApiFailure({ success: false }, 200)).toBe(true);
+    expect(isApiFailure({ testResult: { success: false } }, 200)).toBe(true);
+  });
+});
+
+describe('extractApiError — new shapes', () => {
+  it('reads {success:false, message}', () => {
+    expect(extractApiError({ success: false, message: 'Invalid token' }, 'fb')).toBe('Invalid token');
+  });
+  it('reads {testResult:{success:false, message}}', () => {
+    expect(extractApiError({ testResult: { success: false, message: 'application token is invalid' } }, 'fb'))
+      .toBe('application token is invalid');
+  });
+  it('still honors existing {error} shape (regression)', () => {
+    expect(extractApiError({ error: 'boom' }, 'fb')).toBe('boom');
+  });
+  it('falls back when nothing parses', () => {
+    expect(extractApiError({ weird: 1 }, 'fallback msg')).toBe('fallback msg');
   });
 });
