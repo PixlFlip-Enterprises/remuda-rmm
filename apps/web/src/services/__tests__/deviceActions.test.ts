@@ -6,7 +6,10 @@ import {
   executeScript,
   sendBulkCommand,
   sendDeviceCommand,
-  toggleMaintenanceMode
+  sendWakeCommand,
+  toggleMaintenanceMode,
+  WakeCommandError,
+  wakeFriendlyErrorMessage
 } from '../deviceActions';
 
 vi.mock('@/stores/auth', () => ({
@@ -216,6 +219,93 @@ describe('deviceActions service', () => {
       fetchWithAuthMock.mockResolvedValue(makeResponse({ message: 'Delete rejected' }, false, 403));
 
       await expect(decommissionDevice('dev-1')).rejects.toThrow('Delete rejected');
+    });
+  });
+
+  describe('sendWakeCommand', () => {
+    it('returns the wake response body on a successful dispatch', async () => {
+      const wakeResponse = {
+        deviceId: 'dev-1',
+        type: 'wake_on_lan',
+        status: 'dispatched',
+        wakeAttemptId: 'wake-1',
+        relay: { deviceId: 'relay-1', hostname: 'PEER-01' },
+        network: '10.0.1.0/24',
+        broadcast: '10.0.1.255',
+        macs: ['aa:bb:cc:dd:ee:ff']
+      };
+      fetchWithAuthMock.mockResolvedValue(makeResponse(wakeResponse));
+
+      const result = await sendWakeCommand('dev-1');
+
+      expect(fetchWithAuthMock).toHaveBeenCalledWith('/devices/dev-1/commands', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'wake' })
+      });
+      expect(result).toEqual(wakeResponse);
+    });
+
+    it('throws WakeCommandError carrying server-side code and message on 412', async () => {
+      // 412 NO_MACS is the most common pre-flight rejection: agent hasn't checked
+      // in yet, so we have no MAC to wake. UI relies on .code + .message both
+      // being preserved through the throw.
+      fetchWithAuthMock.mockResolvedValue(
+        makeResponse(
+          {
+            error:
+              'Target has no recorded MAC address. The agent must check in at least once before Wake-on-LAN is available.',
+            code: 'NO_MACS'
+          },
+          false,
+          412
+        )
+      );
+
+      const err = await sendWakeCommand('dev-1').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(WakeCommandError);
+      const wakeErr = err as WakeCommandError;
+      expect(wakeErr.code).toBe('NO_MACS');
+      expect(wakeErr.message).toBe(
+        'Target has no recorded MAC address. The agent must check in at least once before Wake-on-LAN is available.'
+      );
+    });
+
+    it('falls back to a default message when the error body has no error/message fields', async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({ code: 'NO_RELAY' }, false, 503));
+
+      const err = await sendWakeCommand('dev-1').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(WakeCommandError);
+      expect((err as WakeCommandError).code).toBe('NO_RELAY');
+      expect((err as Error).message).toBe('Failed to send wake command');
+    });
+
+    it('still throws WakeCommandError when the error body is unparseable JSON', async () => {
+      fetchWithAuthMock.mockResolvedValue({
+        ok: false,
+        status: 500,
+        json: vi.fn().mockRejectedValue(new Error('invalid json'))
+      } as unknown as Response);
+
+      const err = await sendWakeCommand('dev-1').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(WakeCommandError);
+      expect((err as WakeCommandError).code).toBeUndefined();
+    });
+  });
+
+  describe('wakeFriendlyErrorMessage', () => {
+    it('maps every documented failure code to a user-readable string', () => {
+      expect(wakeFriendlyErrorMessage('NO_MACS')).toContain('No MAC address');
+      expect(wakeFriendlyErrorMessage('NO_SUBNET')).toContain('subnet mask');
+      expect(wakeFriendlyErrorMessage('IPV6_ONLY')).toContain('IPv4');
+      expect(wakeFriendlyErrorMessage('NO_RELAY')).toContain('online peer agent');
+      expect(wakeFriendlyErrorMessage('RELAY_OVERRIDE_INVALID')).toContain('relay');
+      expect(wakeFriendlyErrorMessage('WS_SEND_FAILED')).toContain('Try again');
+      expect(wakeFriendlyErrorMessage('TARGET_NOT_FOUND')).toContain('Device not found');
+    });
+
+    it('returns null for unknown / undefined codes so callers fall back to the raw server message', () => {
+      expect(wakeFriendlyErrorMessage(undefined)).toBeNull();
+      expect(wakeFriendlyErrorMessage('UNKNOWN_CODE_FROM_FUTURE')).toBeNull();
     });
   });
 
