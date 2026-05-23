@@ -21,6 +21,8 @@ import {
 import { eq, and, inArray, asc } from 'drizzle-orm';
 import { getRedis, getBullMQConnection, isRedisAvailable } from './redis';
 import { rateLimiter } from './rate-limit';
+import { checkNotificationThrottle } from './notificationThrottle';
+import { createAuditLogAsync } from './auditService';
 import { interpolateTemplate } from './alertConditions';
 import {
   sendEmailNotification,
@@ -357,6 +359,64 @@ async function processSendNotification(data: SendNotificationJobData): Promise<{
         success: false,
         channelType: channel.type,
         error: `Rate limited (resets at ${rateLimitResult.resetAt.toISOString()})`,
+        durationMs: Date.now() - startTime
+      };
+    }
+  }
+
+  // Feature #4: per-channel sliding-window throttle (defense-in-depth vs alert storms).
+  // Keyed by (channelId, device:<deviceId>) so one flooding device cannot starve other devices.
+  if (channel.throttleMaxPerWindow && channel.throttleMaxPerWindow > 0) {
+    const windowSeconds = channel.throttleWindowSeconds ?? 3600;
+    const throttle = await checkNotificationThrottle(
+      channel.id,
+      `device:${alert.deviceId}`,
+      channel.throttleMaxPerWindow,
+      windowSeconds
+    );
+    if (!throttle.allowed) {
+      const windowExpiresIso = new Date(throttle.windowExpiresAt).toISOString();
+      const throttleMessage = `Throttled: ${throttle.currentCount} delivered in last ${windowSeconds}s (cap=${channel.throttleMaxPerWindow})`;
+      console.warn(
+        `[NotificationThrottle] Suppressed: channel=${channel.id} device=${alert.deviceId} ` +
+        `count=${throttle.currentCount}/${channel.throttleMaxPerWindow} resetsAt=${windowExpiresIso}`
+      );
+      // Use 'failed' status + descriptive errorMessage so UI / queries that
+      // filter by status see throttled rows alongside other delivery failures.
+      // The alert_notifications.status column carries pending/sent/failed only;
+      // 'suppressed' belongs to the separate alertStatusEnum and would render
+      // as a phantom value here. (See #796 review.)
+      await db.update(alertNotifications)
+        .set({
+          status: 'failed',
+          errorMessage: throttleMessage
+        })
+        .where(eq(alertNotifications.id, notificationRecord.id));
+      // Operator-visible audit event so a misconfigured cap silently eating
+      // alerts is investigable instead of buried in stdout. (See #796 review.)
+      createAuditLogAsync({
+        orgId: alert.orgId,
+        actorType: 'system',
+        actorId: '00000000-0000-0000-0000-000000000000',
+        action: 'alert.notification.throttled',
+        resourceType: 'alert_notification',
+        resourceId: notificationRecord.id,
+        result: 'denied',
+        errorMessage: throttleMessage,
+        details: {
+          channelId: channel.id,
+          channelType: channel.type,
+          deviceId: alert.deviceId,
+          currentCount: throttle.currentCount,
+          maxPerWindow: channel.throttleMaxPerWindow,
+          windowSeconds,
+          windowExpiresAt: windowExpiresIso,
+        },
+      });
+      return {
+        success: false,
+        channelType: channel.type,
+        error: `Throttled (resets at ${windowExpiresIso})`,
         durationMs: Date.now() - startTime
       };
     }
