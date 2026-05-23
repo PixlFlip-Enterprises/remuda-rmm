@@ -37,6 +37,8 @@ vi.mock('../../db/schema', () => ({
     watchdogStatus: 'devices.watchdog_status',
     watchdogLastSeen: 'devices.watchdog_last_seen',
     watchdogVersion: 'devices.watchdog_version',
+    mainAgentSilentSince: 'devices.main_agent_silent_since',
+    lastSeenAt: 'devices.last_seen_at',
     agentTokenHash: 'devices.agent_token_hash',
     tokenIssuedAt: 'devices.token_issued_at',
   },
@@ -270,5 +272,213 @@ describe('POST /agents/:id/heartbeat — manifestTrustKeys delivery (#639)', () 
     // the REST path so agents don't choke parsing the field. The empty
     // array is also what hosted-SaaS returns when no key is provisioned.
     expect(body.manifestTrustKeys).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------
+// #800 — main-agent-silent asymmetry detector
+// ---------------------------------------------------------------------
+
+function buildWatchdogApp(): Hono {
+  const app = new Hono();
+  app.use('*', async (c, next) => {
+    c.set('agent', {
+      deviceId: 'device-1',
+      agentId: 'agent-1',
+      orgId: 'org-1',
+      siteId: 'site-1',
+      role: 'watchdog',
+    });
+    await next();
+  });
+  app.route('/agents', heartbeatRoutes);
+  return app;
+}
+
+describe('POST /agents/:id/heartbeat — main-agent-silent asymmetry detector (#800)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    selectMock.mockReset();
+    updateMock.mockReset();
+    insertMock.mockReset();
+    runOutsideDbContextMock.mockClear();
+    getActiveTrustKeysetMock.mockReset();
+    getActiveTrustKeysetMock.mockResolvedValue([]);
+  });
+
+  const sixteenMinutesAgo = new Date(Date.now() - 16 * 60 * 1000);
+  const oneMinuteAgo = new Date(Date.now() - 60 * 1000);
+
+  it('Watchdog heartbeat when main agent silent >15min → sets mainAgentSilentSince + emits event', async () => {
+    selectMock.mockReturnValueOnce(
+      selectChainResolving([
+        {
+          id: 'device-1',
+          orgId: 'org-1',
+          siteId: 'site-1',
+          hostname: 'TST-LAPTOP-01',
+          osType: 'windows',
+          architecture: 'amd64',
+          lastSeenAt: sixteenMinutesAgo,
+          mainAgentSilentSince: null, // first-transition path
+        },
+      ]),
+    );
+
+    const setSpy = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+    updateMock.mockReturnValue({ set: setSpy });
+
+    selectMock.mockReturnValue(selectChainResolving([])); // agentVersions etc
+
+    const resp = await buildWatchdogApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentVersion: '0.65.15', role: 'watchdog', watchdogState: 'MONITORING' }),
+    });
+
+    expect(resp.status).toBe(200);
+
+    // Update called with mainAgentSilentSince set to a Date
+    expect(setSpy).toHaveBeenCalled();
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg.mainAgentSilentSince).toBeInstanceOf(Date);
+    expect(updateArg.watchdogStatus).toBe('connected');
+
+    // Event emitted
+    const { publishEvent } = await import('../../services/eventBus');
+    expect(publishEvent).toHaveBeenCalledWith(
+      'device.main_agent_silent',
+      'org-1',
+      expect.objectContaining({
+        deviceId: 'device-1',
+        hostname: 'TST-LAPTOP-01',
+        silenceDurationSeconds: expect.any(Number),
+      }),
+      'heartbeat-watchdog-branch',
+      expect.objectContaining({ priority: 'high' }),
+    );
+  });
+
+  it('Watchdog heartbeat when main agent recently heartbeated → does NOT set mainAgentSilentSince + no event', async () => {
+    selectMock.mockReturnValueOnce(
+      selectChainResolving([
+        {
+          id: 'device-1',
+          orgId: 'org-1',
+          hostname: 'TST-LAPTOP-01',
+          lastSeenAt: oneMinuteAgo, // healthy
+          mainAgentSilentSince: null,
+        },
+      ]),
+    );
+    const setSpy = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+    updateMock.mockReturnValue({ set: setSpy });
+    selectMock.mockReturnValue(selectChainResolving([]));
+
+    await buildWatchdogApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentVersion: '0.65.15', role: 'watchdog', watchdogState: 'MONITORING' }),
+    });
+
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg.mainAgentSilentSince).toBeUndefined();
+    const { publishEvent } = await import('../../services/eventBus');
+    expect(publishEvent).not.toHaveBeenCalled();
+  });
+
+  it('Watchdog heartbeat when device already mainAgentSilentSince → does NOT re-emit event (no spam)', async () => {
+    // Already-silent state: subsequent watchdog ticks should idempotently
+    // update watchdog cols without re-firing the event.
+    selectMock.mockReturnValueOnce(
+      selectChainResolving([
+        {
+          id: 'device-1',
+          orgId: 'org-1',
+          hostname: 'host',
+          lastSeenAt: sixteenMinutesAgo,
+          mainAgentSilentSince: new Date(Date.now() - 10 * 60 * 1000),
+        },
+      ]),
+    );
+    const setSpy = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+    updateMock.mockReturnValue({ set: setSpy });
+    selectMock.mockReturnValue(selectChainResolving([]));
+
+    await buildWatchdogApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentVersion: '0.65.15', role: 'watchdog', watchdogState: 'MONITORING' }),
+    });
+
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    // Already-set timestamp must NOT be overwritten on subsequent ticks
+    // (the first-set timestamp tracks "how long has this been going").
+    expect(updateArg.mainAgentSilentSince).toBeUndefined();
+    const { publishEvent } = await import('../../services/eventBus');
+    expect(publishEvent).not.toHaveBeenCalled();
+  });
+
+  it('Main-agent heartbeat after silence → clears mainAgentSilentSince to NULL', async () => {
+    selectMock.mockReturnValueOnce(
+      selectChainResolving([
+        {
+          id: 'device-1',
+          orgId: 'org-1',
+          siteId: 'site-1',
+          hostname: 'host',
+          osType: 'windows',
+          architecture: 'amd64',
+          agentVersion: '0.65.15',
+          deviceRoleSource: 'auto',
+          mainAgentSilentSince: new Date(Date.now() - 5 * 60 * 1000), // currently in silent state
+        },
+      ]),
+    );
+    const setSpy = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+    updateMock.mockReturnValue({ set: setSpy });
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+    selectMock.mockReturnValue(selectChainResolving([]));
+
+    await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg.mainAgentSilentSince).toBeNull();
+    expect(updateArg.status).toBe('online');
+  });
+
+  it('Main-agent heartbeat with no prior silence → does not touch mainAgentSilentSince', async () => {
+    selectMock.mockReturnValueOnce(
+      selectChainResolving([
+        {
+          id: 'device-1',
+          orgId: 'org-1',
+          siteId: 'site-1',
+          hostname: 'host',
+          osType: 'windows',
+          architecture: 'amd64',
+          agentVersion: '0.65.15',
+          deviceRoleSource: 'auto',
+          mainAgentSilentSince: null,
+        },
+      ]),
+    );
+    const setSpy = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+    updateMock.mockReturnValue({ set: setSpy });
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+    selectMock.mockReturnValue(selectChainResolving([]));
+
+    await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg.mainAgentSilentSince).toBeUndefined();
   });
 });

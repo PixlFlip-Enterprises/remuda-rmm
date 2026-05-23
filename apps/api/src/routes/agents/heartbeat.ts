@@ -72,18 +72,58 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   const isWatchdog = agent.role === 'watchdog';
 
   if (isWatchdog) {
-    // Update watchdog-specific columns only — don't touch agent metrics
+    // #800 Layer C — asymmetry detector. When this watchdog heartbeat
+    // arrives, check whether the MAIN agent's lastSeenAt is past the
+    // silence threshold. If so, mark the device as
+    // `mainAgentSilentSince=NOW()` (idempotent across subsequent
+    // watchdog ticks) and emit `device.main_agent_silent` on the first
+    // transition. The flag is cleared by the main-agent branch below
+    // when the agent recovers.
+    //
+    // Threshold: 15 minutes = 3x the default 5-min offline-detector
+    // window per the issue's "3 * heartbeat_interval" guidance. Stays
+    // comfortably above transient network blips while remaining well
+    // inside the typical "operator notices something is off" window.
+    const MAIN_AGENT_SILENT_THRESHOLD_MS = 15 * 60 * 1000;
+    const now = new Date();
+    const mainAgentSilent = device.lastSeenAt
+      ? now.getTime() - device.lastSeenAt.getTime() > MAIN_AGENT_SILENT_THRESHOLD_MS
+      : false;
+    const transitioningIntoSilent = mainAgentSilent && !device.mainAgentSilentSince;
+
+    const watchdogUpdates: Record<string, unknown> = {
+      watchdogStatus: data.watchdogState === 'FAILOVER' ? 'failover' : 'connected',
+      watchdogLastSeen: now,
+      watchdogVersion: data.agentVersion,
+      updatedAt: now,
+    };
+    if (transitioningIntoSilent) {
+      watchdogUpdates.mainAgentSilentSince = now;
+    }
+
     try {
       await db.update(devices)
-        .set({
-          watchdogStatus: data.watchdogState === 'FAILOVER' ? 'failover' : 'connected',
-          watchdogLastSeen: new Date(),
-          watchdogVersion: data.agentVersion,
-          updatedAt: new Date(),
-        })
+        .set(watchdogUpdates)
         .where(eq(devices.id, device.id));
     } catch (err) {
       console.error('Failed to update watchdog status:', err);
+    }
+
+    // Emit only on the silence→silent transition so subscribers (alerts,
+    // webhooks) don't fire once per watchdog tick during the outage.
+    // The clear-side event fires from the main-agent branch on recovery.
+    if (transitioningIntoSilent) {
+      publishEvent('device.main_agent_silent', device.orgId, {
+        deviceId: device.id,
+        hostname: device.hostname,
+        mainAgentLastSeenAt: device.lastSeenAt?.toISOString() ?? null,
+        watchdogStatus: data.watchdogState === 'FAILOVER' ? 'failover' : 'connected',
+        silenceDurationSeconds: device.lastSeenAt
+          ? Math.round((now.getTime() - device.lastSeenAt.getTime()) / 1000)
+          : null,
+      }, 'heartbeat-watchdog-branch', { priority: 'high' }).catch((err) => {
+        console.error('[heartbeat] device.main_agent_silent publish failed:', err);
+      });
     }
 
     // Claim watchdog-targeted commands (marks as sent to prevent duplicate delivery)
@@ -139,6 +179,15 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     uptimeSeconds: data.uptime ?? null,
     updatedAt: new Date()
   };
+
+  // #800 Layer C — recovery side. If the asymmetry detector previously
+  // set mainAgentSilentSince (watchdog kept reporting while we went
+  // dark), clear it now that the main agent is heartbeating again. No
+  // event emitted on the clear path — the natural `device.online`/
+  // status flip already conveys the recovery to subscribers.
+  if (device.mainAgentSilentSince) {
+    deviceUpdates.mainAgentSilentSince = null;
+  }
 
   // Only update deviceRole if agent provides one and current source is 'auto'
   if (data.deviceRole && device.deviceRoleSource === 'auto') {

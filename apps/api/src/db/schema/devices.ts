@@ -57,6 +57,13 @@ export const devices = pgTable('devices', {
   watchdogStatus: watchdogStatusEnum('watchdog_status'),
   watchdogLastSeen: timestamp('watchdog_last_seen'),
   watchdogVersion: varchar('watchdog_version', { length: 50 }),
+  // Asymmetry detector (#800): set when the watchdog is still reporting
+  // in but the main agent has gone silent past the offline threshold.
+  // Cleared when the main agent next heartbeats. Distinct from
+  // status='offline' which only reflects main-agent silence — operators
+  // need to know "box alive, only the BreezeAgent service is wedged" so
+  // their support workflow is "remote restart" not "physical visit."
+  mainAgentSilentSince: timestamp('main_agent_silent_since'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 });
