@@ -234,7 +234,16 @@ class EventBus {
 
   /**
    * Invoke local in-process handlers for an event
-   * Called when publishing to handle local subscribers immediately
+   * Called when publishing to handle local subscribers immediately.
+   *
+   * Failures here are swallowed (not rethrown) so one buggy subscriber
+   * can't take down the publishEvent path — the BullMQ subscribers in
+   * webhookDelivery.ts and automationWorker.ts depend on this. The
+   * tradeoff is silent failure of e.g. a dropped delivery enqueue, so
+   * each failure is emitted as a structured log line (JSON-shaped via
+   * console.error) that carries enough context (event.id, event.orgId,
+   * event.source, event.type, handler index) to be searchable by an
+   * operator and pulled into ops dashboards. See issue #820.
    */
   private async invokeLocalHandlers(event: BreezeEvent): Promise<void> {
     const typeHandlers = this.handlers.get(event.type) || new Set();
@@ -243,12 +252,30 @@ class EventBus {
 
     if (allHandlers.length === 0) return;
 
+    let handlerIndex = 0;
     for (const handler of allHandlers) {
       try {
         await handler(event);
       } catch (err) {
-        console.error(`[EventBus] Local handler failed for ${event.type}:`, err);
+        // Structured shape so ops can grep / aggregate / forward to a
+        // log aggregator. Keep using console.error rather than throw so
+        // a single failing subscriber doesn't stop the publish loop.
+        console.error(
+          '[EventBus] local-handler-failed',
+          JSON.stringify({
+            errorId: 'EVENT_BUS_LOCAL_HANDLER_FAILED',
+            eventId: event.id,
+            eventType: event.type,
+            orgId: event.orgId,
+            source: event.source,
+            handlerIndex,
+            error: err instanceof Error
+              ? { name: err.name, message: err.message, stack: err.stack }
+              : String(err),
+          }),
+        );
       }
+      handlerIndex += 1;
     }
   }
 
