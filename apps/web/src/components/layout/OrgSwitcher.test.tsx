@@ -186,4 +186,30 @@ describe('OrgSwitcher org change navigation', () => {
     expect(reloadMock).not.toHaveBeenCalled();
     expect(hrefSetter).not.toHaveBeenCalled();
   });
+
+  // #989: flipping the scope pill must refresh every list page, not just the
+  // ones that happen to key on orgScope. The pill reloads after the flip,
+  // mirroring the org-switch path.
+  it('reloads after waitForPendingRefresh when flipping the scope pill to All orgs', async () => {
+    const { reloadMock } = stubLocation('/devices');
+
+    render(<OrgSwitcher />);
+
+    fireEvent.click(screen.getByTestId('org-scope-all'));
+
+    expect(setOrgScopeMock).toHaveBeenCalledWith('all');
+    await waitFor(() => expect(reloadMock).toHaveBeenCalledTimes(1));
+    expect(waitForPendingRefreshMock).toHaveBeenCalled();
+  });
+
+  it('does nothing when re-clicking the already-active scope', () => {
+    const { reloadMock } = stubLocation('/devices'); // store starts at orgScope 'current'
+
+    render(<OrgSwitcher />);
+
+    fireEvent.click(screen.getByTestId('org-scope-current'));
+
+    expect(setOrgScopeMock).not.toHaveBeenCalled();
+    expect(reloadMock).not.toHaveBeenCalled();
+  });
 });

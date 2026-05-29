@@ -162,6 +162,18 @@ function OrgScopePill() {
   const setOrgScope = useOrgStore((s) => s.setOrgScope);
   const organizationsCount = useOrgStore((s) => s.organizations.length);
 
+  // Flipping the scope changes the orgId-injection chokepoint in orgStore, but
+  // only pages with `orgScope` in their fetch deps refetch live. Rather than
+  // rely on every list page opting in (easy to miss one), reload after the flip
+  // so the new scope takes effect everywhere immediately — mirroring the
+  // org-switch path. Skip the reload when the active scope is re-clicked (#989).
+  const applyScope = async (next: 'current' | 'all') => {
+    if (next === orgScope) return;
+    setOrgScope(next);
+    await waitForPendingRefresh();
+    window.location.reload();
+  };
+
   if (organizationsCount <= 1) return null;
 
   return (
@@ -174,7 +186,7 @@ function OrgScopePill() {
       <button
         type="button"
         data-testid="org-scope-current"
-        onClick={() => setOrgScope('current')}
+        onClick={() => void applyScope('current')}
         aria-pressed={orgScope === 'current'}
         className={cn(
           'flex items-center gap-1 px-2 py-1.5 transition-colors',
@@ -190,7 +202,7 @@ function OrgScopePill() {
       <button
         type="button"
         data-testid="org-scope-all"
-        onClick={() => setOrgScope('all')}
+        onClick={() => void applyScope('all')}
         aria-pressed={orgScope === 'all'}
         className={cn(
           'flex items-center gap-1 px-2 py-1.5 transition-colors',
