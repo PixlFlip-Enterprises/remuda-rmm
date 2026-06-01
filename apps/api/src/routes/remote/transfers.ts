@@ -23,9 +23,15 @@ import {
   MAX_ACTIVE_TRANSFERS_PER_ORG,
   MAX_ACTIVE_TRANSFERS_PER_USER
 } from './helpers';
-import type { UserPermissions } from '../../services/permissions';
+import { canAccessSite, type UserPermissions } from '../../services/permissions';
 
 export const transferRoutes = new Hono();
+
+async function resolveSiteAllowedDeviceIds(orgId: string, perms: UserPermissions | undefined): Promise<string[] | null> {
+  if (!perms?.allowedSiteIds) return null;
+  const orgDevices = await db.select({ id: devices.id, siteId: devices.siteId }).from(devices).where(eq(devices.orgId, orgId));
+  return orgDevices.filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId)).map((d) => d.id);
+}
 
 // POST /remote/transfers - Initiate file transfer
 transferRoutes.post(
@@ -171,6 +177,7 @@ transferRoutes.get(
   zValidator('query', listTransfersSchema),
   async (c) => {
     const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
     const query = c.req.valid('query');
     const { page, limit, offset } = getPagination(query);
 
@@ -196,6 +203,23 @@ transferRoutes.get(
 
     if (auth.scope !== 'system') {
       conditions.push(eq(fileTransfers.userId, auth.user.id));
+    }
+
+    if (perms?.allowedSiteIds) {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      const allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
+      if (query.deviceId && !allowedDeviceIds!.includes(query.deviceId)) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      if (!allowedDeviceIds || allowedDeviceIds.length === 0) {
+        return c.json({
+          data: [],
+          pagination: { page, limit, total: 0 }
+        });
+      }
+      conditions.push(inArray(devices.siteId, perms.allowedSiteIds));
     }
 
     // Additional filters
@@ -285,6 +309,15 @@ transferRoutes.get(
     }
 
     const { transfer, device } = result;
+
+    // Site-scope is an app-layer-only authz axis; RLS does NOT defend it.
+    // `getTransferWithOrgCheck` only org-gates, so re-enforce site scope here.
+    // Fail closed on null siteId.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId))) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
     if (!hasSessionOrTransferOwnership(auth, transfer.userId)) {
       return c.json({ error: 'Access denied' }, 403);
     }
@@ -491,7 +524,16 @@ transferRoutes.get(
       return c.json({ error: 'Transfer not found' }, 404);
     }
 
-    const { transfer } = result;
+    const { transfer, device } = result;
+
+    // Site-scope is an app-layer-only authz axis; RLS does NOT defend it.
+    // `/download` streams the transferred file content, so re-enforce site scope
+    // before any storage access. Fail closed on null siteId.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId))) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
     if (!hasSessionOrTransferOwnership(auth, transfer.userId)) {
       return c.json({ error: 'Access denied' }, 403);
     }

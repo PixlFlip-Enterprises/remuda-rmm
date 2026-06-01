@@ -64,15 +64,19 @@ vi.mock('../middleware/auth', () => ({
       orgCondition: () => undefined,
       canAccessOrg: (id: string) => id === 'org-111',
     });
+    // NOTE: authMiddleware does NOT populate `permissions` in production — only
+    // requirePermission does. Keeping it out here means a route relying on
+    // `permissions` for site-scoping but lacking the gate fails its tests.
     return next();
   }),
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
   requirePermission: vi.fn(() => async (c: any, next: any) => {
+    // Mirror prod: requirePermission is the gate that populates `permissions`.
     const allowedSiteIds = c.req.header('x-restrict-site')
-      ? [c.req.header('x-restrict-site') as string]
+      ? (c.req.header('x-restrict-site') === '__empty__' ? [] : [c.req.header('x-restrict-site') as string])
       : undefined;
     c.set('permissions', {
-      permissions: [{ resource: 'devices', action: 'write' }],
+      permissions: [{ resource: 'devices', action: 'read' }],
       partnerId: null,
       orgId: 'org-111',
       roleId: 'role-1',
@@ -89,6 +93,7 @@ vi.mock('../middleware/auth', () => ({
 vi.mock('../services/permissions', () => ({
   canAccessSite: (perms: any, siteId: string) =>
     !perms?.allowedSiteIds || perms.allowedSiteIds.includes(siteId),
+  PERMISSIONS: { DEVICES_READ: { resource: 'devices', action: 'read' } },
 }));
 
 vi.mock('../jobs/networkBaselineWorker', () => ({ enqueueBaselineScan: vi.fn() }));
@@ -148,6 +153,28 @@ describe('Network baselines — POST / site-scope enforcement', () => {
     vi.clearAllMocks();
     app = new Hono();
     app.route('/baselines', networkBaselineRoutes);
+  });
+
+  it('returns 403 on GET / when a site-restricted caller filters to an out-of-scope site', async () => {
+    rigSiteLookup({ id: FORBIDDEN_SITE_ID });
+
+    const res = await app.request(`/baselines?siteId=${FORBIDDEN_SITE_ID}`, {
+      headers: { 'x-restrict-site': SITE_ID },
+    });
+
+    expect(res.status).toBe(403);
+    expect(db.select).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns an empty GET / list when the site allowlist is empty', async () => {
+    const res = await app.request('/baselines', {
+      headers: { 'x-restrict-site': '__empty__' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual([]);
+    expect(body.pagination.total).toBe(0);
   });
 
   it('returns 403 when a site-restricted caller targets a site outside the allowlist', async () => {

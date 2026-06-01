@@ -171,6 +171,17 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // helper (routes/remote/helpers.ts), which the file-local scanner can't see.
   'routes/remote/sessions.ts:POST /sessions',
   'routes/remote/transfers.ts:POST /transfers',
+  // ---- Org-wide AGGREGATE reads: return only counts/summaries (no
+  // per-device rows), so no cross-site device data is disclosed (returns
+  // re-verified 2026-05-31). NB: totals still span the org incl. other
+  // sites — site-scoping the aggregates themselves is a separate product call.
+  'routes/huntress.ts:GET /status',
+  'routes/metrics.ts:GET /',
+  'routes/metrics.ts:GET /trends',
+  'routes/reports/data.ts:GET /data/compliance',
+  'routes/sentinelOne.ts:GET /status',
+  'routes/softwarePolicies.ts:GET /compliance/overview',
+  'routes/updateRings.ts:GET /:id/compliance',
 ]);
 
 // SITE_SCOPE_INPUT_EXEMPT entries that ARE reached via the user `authMiddleware`
@@ -190,6 +201,18 @@ const SITE_SCOPE_INPUT_EXEMPT_USER_SESSION_OK: ReadonlySet<string> = new Set<str
   // Site-gated via the cross-file getDeviceWithOrgCheck resolver (remote/helpers.ts).
   'routes/remote/sessions.ts:POST /sessions',
   'routes/remote/transfers.ts:POST /transfers',
+  // Org-wide AGGREGATE reads: return only counts/summaries (no per-device rows),
+  // so no cross-site device data is disclosed. Reached via user auth but exempt
+  // for the aggregate reason rather than non-user auth — recorded here so the
+  // re-verification test (added in #1041) accepts them. (Site-scoping the
+  // aggregate totals themselves is a separate product call.)
+  'routes/huntress.ts:GET /status',
+  'routes/metrics.ts:GET /',
+  'routes/metrics.ts:GET /trends',
+  'routes/reports/data.ts:GET /data/compliance',
+  'routes/sentinelOne.ts:GET /status',
+  'routes/softwarePolicies.ts:GET /compliance/overview',
+  'routes/updateRings.ts:GET /:id/compliance',
 ]);
 
 // BASELINE RATCHET — pre-existing handlers flagged at the time this detector
@@ -207,57 +230,6 @@ const SITE_SCOPE_INPUT_EXEMPT_USER_SESSION_OK: ReadonlySet<string> = new Set<str
 // the ratchet one-directional — a fixed handler's baseline entry must be removed.
 // Full plan + triage guidance: docs/superpowers/plans/2026-05-31-site-scope-input-scanner.md
 const SITE_SCOPE_INPUT_BASELINE: ReadonlySet<string> = new Set<string>([
-  'routes/alerts/alerts.ts:GET /',
-  'routes/auditLogs.ts:GET /logs/:id',
-  'routes/backup/bmr.ts:GET /bmr/tokens',
-  'routes/backup/dashboard.ts:GET /dashboard',
-  'routes/backup/jobs.ts:GET /jobs',
-  'routes/backup/jobs.ts:GET /jobs/:id',
-  'routes/backup/restore.ts:GET /restore',
-  'routes/backup/sla.ts:GET /events',
-  'routes/backup/snapshots.ts:GET /snapshots',
-  'routes/backup/vault.ts:GET /',
-  'routes/changes.ts:GET /',
-  'routes/cisHardening.ts:GET /compliance',
-  'routes/cisHardening.ts:GET /remediations',
-  'routes/deployments.ts:GET /:id/devices',
-  'routes/discovery.ts:GET /assets',
-  'routes/groups.ts:GET /',
-  'routes/groups.ts:GET /:id/devices',
-  'routes/groups.ts:GET /:id/membership-log',
-  'routes/huntress.ts:GET /status',
-  'routes/metrics.ts:GET /',
-  'routes/metrics.ts:GET /trends',
-  'routes/mobile.ts:GET /alerts/inbox',
-  'routes/mobile.ts:GET /devices',
-  'routes/mobile.ts:GET /search',
-  'routes/monitoring.ts:GET /assets',
-  'routes/monitoring.ts:GET /assets/:id',
-  'routes/monitoring.ts:GET /results',
-  'routes/networkBaselines.ts:GET /',
-  'routes/networkChanges.ts:GET /',
-  'routes/patches/compliance.ts:GET /compliance',
-  'routes/playbooks.ts:GET /executions',
-  'routes/playbooks.ts:GET /executions/:id',
-  'routes/policyManagement/compliance.ts:GET /:id/compliance',
-  'routes/psa.ts:GET /connections/:id/tickets',
-  'routes/psa.ts:GET /tickets',
-  'routes/remote/sessions.ts:GET /sessions',
-  'routes/remote/sessions.ts:GET /sessions/history',
-  'routes/remote/transfers.ts:GET /transfers',
-  'routes/reports/data.ts:GET /data/compliance',
-  'routes/reports/data.ts:GET /data/device-inventory',
-  'routes/reports/data.ts:GET /data/metrics',
-  'routes/reports/data.ts:GET /data/software-inventory',
-  'routes/reports/generate.ts:POST /generate',
-  'routes/sentinelOne.ts:GET /status',
-  'routes/snmp.ts:GET /dashboard',
-  'routes/softwareInventory.ts:GET /',
-  'routes/softwareInventory.ts:GET /:name/devices',
-  'routes/softwarePolicies.ts:GET /compliance/overview',
-  'routes/softwarePolicies.ts:GET /violations',
-  'routes/tunnels.ts:GET /allowlist',
-  'routes/updateRings.ts:GET /:id/compliance',
 ]);
 
 describe('site-scope coverage — input-sourced / list-style', () => {
@@ -398,10 +370,25 @@ const DEAD_PERMS_GATE_EXEMPT: ReadonlySet<string> = new Set<string>([
 // mock rather than a requirePermission mock). The detector keeps them visible
 // and blocks any NEW offender.
 const DEAD_PERMS_GATE_BASELINE: ReadonlySet<string> = new Set<string>([
+  // Introduced by #1041 (mutations batch1) — added the perms gate, omitted requirePermission.
   'routes/networkBaselines.ts:GET /:id',
   'routes/networkBaselines.ts:GET /:id/changes',
   'routes/remote/sessions.ts:DELETE /sessions/stale',
   'routes/remote/sessions.ts:POST /sessions/:id/offer',
+  // Introduced by #1042 (reads batch2) — same shape: these reads gate on
+  // `perms?.allowedSiteIds` (and pass `perms` to getDeviceWithOrgCheck) but no
+  // `requirePermission` populates `c.get('permissions')`, so the gate is dead.
+  // remote/sessions + remote/transfers routers carry NO requirePermission at all
+  // (router-level decision for the author). No regression — these reads had no
+  // site-scope before. FOLLOW-UP: one focused PR adds requirePermission(DEVICES_READ)
+  // to all 11 dead reads here + de-masks the route tests. Detector keeps them visible.
+  'routes/networkChanges.ts:GET /:id',
+  'routes/remote/sessions.ts:GET /sessions',
+  'routes/remote/sessions.ts:GET /sessions/history',
+  'routes/remote/sessions.ts:GET /sessions/:id',
+  'routes/remote/transfers.ts:GET /transfers',
+  'routes/remote/transfers.ts:GET /transfers/:id',
+  'routes/remote/transfers.ts:GET /transfers/:id/download',
 ]);
 
 describe('site-scope coverage — dead permissions-sourced gate', () => {

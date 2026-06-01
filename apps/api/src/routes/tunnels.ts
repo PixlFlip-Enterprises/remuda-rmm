@@ -1,7 +1,7 @@
 import { Hono, type Context } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
-import { and, eq, desc, inArray } from 'drizzle-orm';
+import { and, eq, desc, inArray, isNull, or } from 'drizzle-orm';
 import { db, withSystemDbAccessContext } from '../db';
 import { tunnelSessions, tunnelAllowlists, devices, users, remoteSessions } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
@@ -171,6 +171,31 @@ async function getDeviceForTunnel(c: Context, deviceId: string, auth: AuthContex
   return device;
 }
 
+// Site-scope is an app-layer-only authz axis (`permissions.allowedSiteIds`); RLS
+// does NOT defend it. Org-scope callers are already limited to their own tunnels
+// by the userId filter, but PARTNER-scope callers with `allowedSiteIds` set would
+// otherwise see/read every org tunnel session regardless of site. These helpers
+// resolve device sites so the list can be narrowed and the detail can 403.
+async function resolveSiteAllowedDeviceIds(orgIds: string[], perms: UserPermissions | undefined): Promise<string[] | null> {
+  if (!perms?.allowedSiteIds) return null;
+  if (orgIds.length === 0) return [];
+  const orgDevices = await db
+    .select({ id: devices.id, siteId: devices.siteId })
+    .from(devices)
+    .where(orgIds.length === 1 ? eq(devices.orgId, orgIds[0]!) : inArray(devices.orgId, orgIds));
+  return orgDevices.filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId)).map((d) => d.id);
+}
+
+async function isTunnelDeviceSiteDenied(deviceId: string, perms: UserPermissions | undefined): Promise<boolean> {
+  if (!perms?.allowedSiteIds) return false;
+  const [device] = await db
+    .select({ siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+  return !device || typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId);
+}
+
 async function getActiveAllowlistPatterns(orgId: string): Promise<string[]> {
   const rules = await db
     .select({ pattern: tunnelAllowlists.pattern })
@@ -289,8 +314,13 @@ tunnelRoutes.post(
 tunnelRoutes.get(
   '/',
   requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` (only requirePermission sets it, not authMiddleware/
+  // requireScope) so the site narrowing below is live. DEVICES_READ is granted to
+  // every device-viewing role, so this adds no lockout.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
     const status = c.req.query('status');
 
     const conditions: ReturnType<typeof eq>[] = [];
@@ -301,6 +331,17 @@ tunnelRoutes.get(
     // Partner/system admins can see all tunnels in the org.
     if (auth.scope === 'organization') {
       conditions.push(eq(tunnelSessions.userId, auth.user.id));
+    }
+    // Site-scope (app-layer-only authz axis) narrowing. The userId filter above
+    // already bounds org-scope callers, but partner-scope callers with
+    // `allowedSiteIds` set would otherwise see every org tunnel session.
+    if (perms?.allowedSiteIds) {
+      const orgPool = auth.orgId ? [auth.orgId] : (auth.accessibleOrgIds ?? []);
+      const allowedDeviceIds = await resolveSiteAllowedDeviceIds(orgPool, perms);
+      if (!allowedDeviceIds || allowedDeviceIds.length === 0) {
+        return c.json([]);
+      }
+      conditions.push(inArray(tunnelSessions.deviceId, allowedDeviceIds));
     }
     if (status) {
       const validStatuses = ['pending', 'connecting', 'active', 'disconnected', 'failed'] as const;
@@ -326,9 +367,13 @@ tunnelRoutes.get(
 tunnelRoutes.get(
   '/allowlist',
   requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` so the site narrowing below is live (only
+  // requirePermission sets it). DEVICES_READ is granted to every device-viewing role.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
   zValidator('query', listQuerySchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
     if (!auth.orgId) {
       return c.json({ error: 'Org context required' }, 400);
     }
@@ -336,7 +381,15 @@ tunnelRoutes.get(
     const { siteId } = c.req.valid('query');
     const conditions: ReturnType<typeof eq>[] = [eq(tunnelAllowlists.orgId, auth.orgId)];
     if (siteId) {
+      if (perms?.allowedSiteIds && !canAccessSite(perms, siteId)) {
+        return c.json({ error: 'Access to this site denied' }, 403);
+      }
       conditions.push(eq(tunnelAllowlists.siteId, siteId));
+    } else if (perms?.allowedSiteIds) {
+      conditions.push(or(
+        isNull(tunnelAllowlists.siteId),
+        inArray(tunnelAllowlists.siteId, perms.allowedSiteIds)
+      )! as ReturnType<typeof eq>);
     }
 
     const rules = await db
@@ -456,6 +509,10 @@ tunnelRoutes.delete(
 tunnelRoutes.get(
   '/:id',
   requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` so the site-scope re-enforcement below is live (a
+  // site-restricted org user must not read a colleague's tunnel to an out-of-site
+  // device). DEVICES_READ is granted to every device-viewing role.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
   zValidator('param', idParamSchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
@@ -477,6 +534,13 @@ tunnelRoutes.get(
 
     if (!session) {
       return c.json({ error: 'Tunnel session not found' }, 404);
+    }
+
+    // Site-scope (app-layer-only) re-enforcement: deny when the session's device
+    // sits outside the caller's allowed sites. Fail closed on null siteId.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (await isTunnelDeviceSiteDenied(session.deviceId, perms)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
     }
 
     return c.json(session);

@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
-import { and, eq, sql, desc, gte, lte, inArray } from 'drizzle-orm';
+import { and, or, eq, sql, desc, gte, lte, inArray, isNull, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
 import {
   alertRules,
@@ -11,12 +11,13 @@ import {
   alertNotifications,
   devices,
 } from '../../db/schema';
-import { requireScope } from '../../middleware/auth';
+import { requireScope, requirePermission } from '../../middleware/auth';
 import { setCooldown, markConfigPolicyRuleCooldown } from '../../services/alertCooldown';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { publishEvent } from '../../services/eventBus';
 import { listAlertsSchema, resolveAlertSchema, suppressAlertSchema, bulkAlertActionSchema } from './schemas';
 import { getPagination, ensureOrgAccess, getAlertWithOrgCheck } from './helpers';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../../services/permissions';
 
 export const alertsRoutes = new Hono();
 
@@ -26,14 +27,20 @@ const alertIdParamSchema = z.object({ id: z.string().uuid() });
 alertsRoutes.get(
   '/',
   requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` in context — the site-scope narrowing below reads
+  // `c.get('permissions')`, which ONLY requirePermission sets (not authMiddleware/
+  // requireScope). Without this the narrowing is dead code. ALERTS_READ is granted
+  // to every alert-viewing role, so this adds no lockout.
+  requirePermission(PERMISSIONS.ALERTS_READ.resource, PERMISSIONS.ALERTS_READ.action),
   zValidator('query', listAlertsSchema),
   async (c) => {
     const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
     const query = c.req.valid('query');
     const { page, limit, offset } = getPagination(query);
 
     // Build conditions array
-    const conditions: ReturnType<typeof eq>[] = [];
+    const conditions: SQL[] = [];
 
     // Filter by org access based on scope
     if (auth.scope === 'organization') {
@@ -75,6 +82,30 @@ alertsRoutes.get(
       conditions.push(eq(alerts.deviceId, query.deviceId));
     }
 
+    if (perms?.allowedSiteIds) {
+      if (query.deviceId && auth.orgId) {
+        const [device] = await db
+          .select({ id: devices.id, siteId: devices.siteId })
+          .from(devices)
+          .where(and(eq(devices.id, query.deviceId), eq(devices.orgId, auth.orgId)))
+          .limit(1);
+
+        if (!device || typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId)) {
+          return c.json({ error: 'Device not found or access denied' }, 403);
+        }
+      }
+
+      // Org-wide alerts (deviceId null) are not site-bound, so keep them visible
+      // alongside in-scope device alerts (the leftJoin makes a device-less alert's
+      // siteId null, which inArray would otherwise drop). A caller restricted to
+      // zero sites still sees org-wide alerts — only device-bound alerts are hidden.
+      conditions.push(
+        perms.allowedSiteIds.length === 0
+          ? isNull(alerts.deviceId)
+          : or(isNull(alerts.deviceId), inArray(devices.siteId, perms.allowedSiteIds))!
+      );
+    }
+
     if (query.startDate) {
       conditions.push(gte(alerts.triggeredAt, new Date(query.startDate)));
     }
@@ -86,10 +117,12 @@ alertsRoutes.get(
     const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
 
     // Get total count
-    const countResult = await db
+    const countQuery = db
       .select({ count: sql<number>`count(*)` })
-      .from(alerts)
-      .where(whereCondition);
+      .from(alerts);
+    const countResult = await (perms?.allowedSiteIds
+      ? countQuery.leftJoin(devices, eq(alerts.deviceId, devices.id)).where(whereCondition)
+      : countQuery.where(whereCondition));
     const total = Number(countResult[0]?.count ?? 0);
 
     // Get alerts with device and rule info

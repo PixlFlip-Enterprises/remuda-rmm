@@ -6,7 +6,7 @@ import { db } from '../db';
 import { auditLogs as auditLogsTable, users, devices } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission } from '../middleware/auth';
 import { writeRouteAudit } from '../services/auditEvents';
-import { PERMISSIONS } from '../services/permissions';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
 import { csvRow } from '../services/spreadsheetExport';
 
 export const auditLogRoutes = new Hono();
@@ -157,6 +157,7 @@ export type DbRow = {
   userName: string | null;
   deviceHostname: string | null;
   deviceDisplayName: string | null;
+  deviceSiteId?: string | null;
 };
 
 export function resolveActorName(row: DbRow, details?: Record<string, unknown> | null): string {
@@ -525,6 +526,13 @@ function paginatedListHandler(
     const { page, limit, offset } = getPagination(query);
 
     const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    // BY DESIGN: the audit-log list is scoped to the org only, NOT the caller's
+    // site allowlist. Audit trails are an org-level compliance record and must
+    // stay complete for any org member with audit-read permission; partitioning
+    // them by site would hide legitimate entries (and the loose details->>
+    // 'rawActorId' device join is not a reliable site key anyway). The by-id
+    // detail view applies an agent-actor site check as defence-in-depth; the
+    // list intentionally does not. (Site-scope review decision, 2026-05-31.)
     const where = buildFilterConditions(orgCond, query);
     // count(*) on audit_logs is 2-3s under RLS even with the org_timestamp
     // index. The dashboard widget that calls /logs?limit=5 doesn't need the
@@ -591,6 +599,7 @@ auditLogRoutes.get(
         userName: users.name,
         deviceHostname: devices.hostname,
         deviceDisplayName: devices.displayName,
+        deviceSiteId: devices.siteId,
       })
       .from(auditLogsTable)
       .leftJoin(users, eq(auditLogsTable.actorId, users.id))
@@ -602,6 +611,15 @@ auditLogRoutes.get(
 
     if (!row) {
       return c.json({ error: 'Audit log not found' }, 404);
+    }
+
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (
+      perms?.allowedSiteIds
+      && row.log.actorType === 'agent'
+      && (typeof row.deviceSiteId !== 'string' || !canAccessSite(perms, row.deviceSiteId))
+    ) {
+      return c.json({ error: 'Audit log not found or access denied' }, 403);
     }
 
     return c.json(toFullEntry(row));

@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
-import { and, desc, eq, sql, type SQL } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db';
 import {
@@ -17,7 +17,7 @@ import {
 } from '../services/networkBaseline';
 import { isRedisAvailable } from '../services/redis';
 import { writeRouteAudit } from '../services/auditEvents';
-import { canAccessSite, type UserPermissions } from '../services/permissions';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
 import {
   networkEventTypes,
   optionalQueryBooleanSchema,
@@ -110,9 +110,13 @@ networkBaselineRoutes.use('*', authMiddleware);
 networkBaselineRoutes.get(
   '/',
   requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` so the site narrowing below is live (only
+  // requirePermission sets it). DEVICES_READ is granted to every device-viewing role.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
   zValidator('query', listBaselinesSchema),
   async (c) => {
     const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
     const query = c.req.valid('query');
 
     const orgResult = resolveOrgId(auth, query.orgId);
@@ -148,7 +152,22 @@ networkBaselineRoutes.get(
           return c.json({ error: 'Site not found for this organization' }, 404);
         }
       }
+      if (perms?.allowedSiteIds && !canAccessSite(perms, query.siteId)) {
+        return c.json({ error: 'Access to this site denied' }, 403);
+      }
       conditions.push(eq(networkBaselines.siteId, query.siteId));
+    } else if (perms?.allowedSiteIds) {
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json({
+          data: [],
+          pagination: {
+            limit: query.limit ?? 100,
+            offset: query.offset ?? 0,
+            total: 0
+          }
+        });
+      }
+      conditions.push(inArray(networkBaselines.siteId, perms.allowedSiteIds));
     }
 
     if (query.subnet) {

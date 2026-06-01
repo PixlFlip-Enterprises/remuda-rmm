@@ -168,6 +168,12 @@ async function getAlertWithOrgCheck(
   return alert;
 }
 
+async function resolveSiteAllowedDeviceIds(orgId: string, perms: UserPermissions | undefined): Promise<string[] | null> {
+  if (!perms?.allowedSiteIds) return null;
+  const orgDevices = await db.select({ id: devices.id, siteId: devices.siteId }).from(devices).where(eq(devices.orgId, orgId));
+  return orgDevices.filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId)).map((d) => d.id);
+}
+
 // Validation schemas
 const registerDeviceSchema = z.object({
   deviceId: z.string().min(1).max(255),
@@ -559,6 +565,15 @@ mobileRoutes.get(
       conditions.push(inArray(alerts.orgId, orgCheck.orgIds));
     }
 
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds && auth.orgId) {
+      const allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
+      if (!allowedDeviceIds || allowedDeviceIds.length === 0) {
+        return c.json({ data: [], pagination: { page, limit, total: 0, nextCursor: null } });
+      }
+      conditions.push(inArray(alerts.deviceId, allowedDeviceIds));
+    }
+
     if (query.status) {
       conditions.push(eq(alerts.status, query.status));
     }
@@ -814,6 +829,14 @@ mobileRoutes.get(
         return c.json({ data: [], pagination: { page, limit, total: 0, nextCursor: null } });
       }
       conditions.push(inArray(devices.orgId, orgCheck.orgIds));
+    }
+
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds) {
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json({ data: [], pagination: { page, limit, total: 0, nextCursor: null } });
+      }
+      conditions.push(inArray(devices.siteId, perms.allowedSiteIds));
     }
 
     if (query.status) {
@@ -1175,6 +1198,9 @@ type SearchResult =
 mobileRoutes.get(
   '/search',
   requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` so the site narrowing below is live (only
+  // requirePermission sets it). DEVICES_READ is granted to every device-viewing role.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
   userRateLimit('mobile-search', 30, 60),
   zValidator('query', searchQuerySchema),
   async (c) => {
@@ -1197,9 +1223,14 @@ mobileRoutes.get(
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
     const orgFilter = orgCheck.orgIds === null ? undefined : inArray;
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const allowedDeviceIds = perms?.allowedSiteIds && auth.orgId
+      ? await resolveSiteAllowedDeviceIds(auth.orgId, perms)
+      : null;
 
     const deviceWhere = and(
       orgCheck.orgIds === null ? sql`true` : inArray(devices.orgId, orgCheck.orgIds),
+      perms?.allowedSiteIds ? inArray(devices.siteId, perms.allowedSiteIds) : sql`true`,
       or(
         ilike(devices.hostname, term),
         ilike(devices.displayName, term),
@@ -1210,6 +1241,7 @@ mobileRoutes.get(
 
     const alertWhere = and(
       orgCheck.orgIds === null ? sql`true` : inArray(alerts.orgId, orgCheck.orgIds),
+      allowedDeviceIds === null ? sql`true` : inArray(alerts.deviceId, allowedDeviceIds),
       gte(alerts.triggeredAt, thirtyDaysAgo),
       or(ilike(alerts.title, term), ilike(alerts.message, term))
     );
