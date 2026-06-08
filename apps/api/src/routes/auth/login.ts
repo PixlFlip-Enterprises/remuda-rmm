@@ -53,6 +53,8 @@ import {
 } from './helpers';
 import { assertPasswordAuthAllowedBySso, SsoPasswordAuthRequiredError } from './ssoPolicy';
 import { readMobileDeviceId, carryForwardBinding } from '../../services/mobileDeviceBinding';
+import { enforceIpAllowlist, IP_NOT_ALLOWED_BODY, isBlocked } from '../../services/ipAllowlist';
+import { captureException } from '../../services/sentry';
 import { cfAccessLoginMiddleware } from '../../middleware/cfAccessLogin';
 
 const { db, withSystemDbAccessContext } = dbModule;
@@ -359,6 +361,36 @@ loginRoutes.post('/login', cfAccessLoginMiddleware, zValidator('json', loginSche
     });
     await floorPromise;
     return c.json(genericAuthError(), 401);
+  }
+
+  // Partner IP allowlist: block before issuing tokens so the login form shows
+  // a precise error. Platform admins and untrusted-IP fail-open are handled
+  // inside enforceIpAllowlist.
+  let ipDecision;
+  try {
+    ipDecision = await enforceIpAllowlist(c, {
+      partnerId: context.partnerId,
+      isPlatformAdmin: user.isPlatformAdmin === true,
+      actorId: user.id,
+      actorEmail: user.email,
+    });
+  } catch (err) {
+    console.error('[auth] IP allowlist check failed during login:', err);
+    captureException(err, c);
+    await floorPromise;
+    return c.json(genericAuthError(), 401);
+  }
+  if (isBlocked(ipDecision)) {
+    void auditUserLoginFailure(c, {
+      userId: user.id,
+      email: user.email,
+      name: user.name,
+      reason: 'ip_not_allowed',
+      result: 'denied',
+      details: { method: 'password' },
+    });
+    await floorPromise;
+    return c.json(IP_NOT_ALLOWED_BODY, 403);
   }
 
   // Check if MFA is required. This happens after the SSO-only check so an

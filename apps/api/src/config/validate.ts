@@ -466,6 +466,7 @@ const envSchema = z
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
     PARTNER_HOOKS_URL: z.string().url().optional(),
     PARTNER_HOOKS_SECRET: z.string().min(16).optional(),
+    IP_ALLOWLIST_ENFORCEMENT_MODE: z.enum(['enforce', 'off']).default('enforce'),
 
     // -- Alternative LLM backend (openai-compatible, e.g. vLLM) ---------------
     // Off by default. Chat-only PoC; tool-calling is not supported on this path.

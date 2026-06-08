@@ -11,6 +11,7 @@ import { ENABLE_2FA } from '../routes/auth/schemas';
 import { assertActiveTenantContext, TenantInactiveError } from '../services/tenantStatus';
 import { writeAuditEvent } from '../services/auditEvents';
 import { mfaForcePartnerAdmin } from '../config/env';
+import { ipAllowlistGuard } from './ipAllowlistGuard';
 
 export interface AuthContext {
   user: {
@@ -451,7 +452,7 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
         canAccessSite
       });
 
-      await next();
+      return ipAllowlistGuard(c, next);
     }
   );
 }
