@@ -60,6 +60,8 @@ vi.mock('../db/schema', () => ({
   organizations: { id: 'id', partnerId: 'partnerId' },
   alerts: { id: 'id', orgId: 'orgId' },
   devices: { id: 'id', orgId: 'orgId' },
+  users: { id: 'id', partnerId: 'partnerId' },
+  ticketCategories: { id: 'id', partnerId: 'partnerId' },
   ticketStatusEnum: { enumValues: ['new', 'open', 'pending', 'on_hold', 'resolved', 'closed'] },
   ticketSourceEnum: { enumValues: ['portal', 'email', 'alert', 'manual', 'api', 'ai'] }
 }));
@@ -107,7 +109,9 @@ describe('createTicket', () => {
   });
 
   it('inserts with status open when assigneeId is provided', async () => {
-    dbMocks.selectResult.mockResolvedValue([{ id: 'o-1', partnerId: 'p-1' }]);
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }])   // org
+      .mockResolvedValueOnce([{ id: 'u-99', partnerId: 'p-1' }]); // assignee
     dbMocks.insertReturning.mockResolvedValue([{ id: 't-2', orgId: 'o-1', internalNumber: 'T-2026-0043', status: 'open' }]);
 
     await createTicket({ orgId: 'o-1', subject: 'Test', source: 'manual', assigneeId: 'u-99' }, actor);
@@ -270,7 +274,9 @@ describe('assignTicket', () => {
   });
 
   it('updates assignee, writes an assignment feed entry, emits ticket.assigned', async () => {
-    dbMocks.selectResult.mockResolvedValue([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'new', assignedTo: null }]);
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'new', assignedTo: null }])  // ticket
+      .mockResolvedValueOnce([{ id: 'u-2', partnerId: 'p-1' }]);                                                 // assignee
     dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', assignedTo: 'u-2', status: 'open' }]);
     dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
 
@@ -290,7 +296,9 @@ describe('assignTicket', () => {
   });
 
   it('throws 409 on concurrent modification and does NOT write a feed entry or emit', async () => {
-    dbMocks.selectResult.mockResolvedValue([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', assignedTo: null }]);
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', assignedTo: null }])  // ticket
+      .mockResolvedValueOnce([{ id: 'u-2', partnerId: 'p-1' }]); // assignee
     dbMocks.updateReturning.mockResolvedValue([]);
 
     const err = await assignTicket('t-1', 'u-2', actor).catch(e => e);
@@ -751,5 +759,155 @@ describe('createTicketFromAlert', () => {
     expect(err).toBeInstanceOf(Error);
     expect(err).not.toBeInstanceOf(TicketServiceError);
     expect(err.message).toMatch(/created but alert link failed/i);
+  });
+});
+
+describe('category tenant validation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    valuesMock.mockClear();
+    setMock.mockClear();
+    allocateMock.mockResolvedValue('T-2026-0042');
+  });
+
+  it('createTicket rejects a category from another partner with 400', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }])        // org
+      .mockResolvedValueOnce([{ id: 'cat-1', partnerId: 'p-OTHER' }]); // category
+
+    const err = await createTicket(
+      { orgId: 'o-1', subject: 'x', source: 'manual', categoryId: 'cat-1' }, actor
+    ).catch(e => e);
+
+    expect(err).toBeInstanceOf(TicketServiceError);
+    expect(err.status).toBe(400);
+    expect(allocateMock).not.toHaveBeenCalled();
+  });
+
+  it('createTicket rejects a nonexistent category with 404', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }]) // org
+      .mockResolvedValueOnce([]);                                // category missing
+
+    const err = await createTicket(
+      { orgId: 'o-1', subject: 'x', source: 'manual', categoryId: 'cat-ghost' }, actor
+    ).catch(e => e);
+
+    expect(err).toBeInstanceOf(TicketServiceError);
+    expect(err.status).toBe(404);
+  });
+
+  it('createTicket accepts a same-partner category', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }])    // org
+      .mockResolvedValueOnce([{ id: 'cat-1', partnerId: 'p-1' }]); // category
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-3', orgId: 'o-1', internalNumber: 'T-2026-0044', status: 'new' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual', categoryId: 'cat-1' }, actor);
+
+    expect(valuesMock.mock.calls[0]![0]).toMatchObject({ categoryId: 'cat-1' });
+  });
+
+  it('updateTicketFields rejects a cross-partner category with 400', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', categoryId: null, subject: 'Printer' }]) // ticket
+      .mockResolvedValueOnce([{ id: 'cat-1', partnerId: 'p-OTHER' }]);                                              // category
+
+    const err = await updateTicketFields('t-1', { categoryId: 'cat-1' }, actor).catch(e => e);
+
+    expect(err).toBeInstanceOf(TicketServiceError);
+    expect(err.status).toBe(400);
+    expect(setMock).not.toHaveBeenCalled();
+  });
+
+  it('updateTicketFields allows clearing the category (null) without a lookup', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', categoryId: 'cat-1', subject: 'Printer' }]); // ticket only
+    dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', categoryId: null }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]); // system feed comment insert
+
+    const t = await updateTicketFields('t-1', { categoryId: null }, actor);
+    expect(t?.categoryId).toBeNull();
+    expect(dbMocks.selectResult).toHaveBeenCalledTimes(1); // no category lookup
+  });
+});
+
+describe('assignee tenant validation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    valuesMock.mockClear();
+    setMock.mockClear();
+    allocateMock.mockResolvedValue('T-2026-0042');
+  });
+
+  it('createTicket rejects an assignee from another partner with 400', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }])      // org
+      .mockResolvedValueOnce([{ id: 'u-evil', partnerId: 'p-OTHER' }]); // assignee
+
+    const err = await createTicket(
+      { orgId: 'o-1', subject: 'x', source: 'manual', assigneeId: 'u-evil' }, actor
+    ).catch(e => e);
+
+    expect(err).toBeInstanceOf(TicketServiceError);
+    expect(err.status).toBe(400);
+    expect(allocateMock).not.toHaveBeenCalled(); // rejected before burning a counter value
+  });
+
+  it('createTicket rejects a nonexistent assignee with 404', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }]) // org
+      .mockResolvedValueOnce([]);                                // assignee missing
+
+    const err = await createTicket(
+      { orgId: 'o-1', subject: 'x', source: 'manual', assigneeId: 'u-ghost' }, actor
+    ).catch(e => e);
+
+    expect(err).toBeInstanceOf(TicketServiceError);
+    expect(err.status).toBe(404);
+  });
+
+  it('createTicket accepts a same-partner assignee', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }])  // org
+      .mockResolvedValueOnce([{ id: 'u-99', partnerId: 'p-1' }]); // assignee
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-2', orgId: 'o-1', internalNumber: 'T-2026-0043', status: 'open' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'Test', source: 'manual', assigneeId: 'u-99' }, actor);
+
+    expect(valuesMock.mock.calls[0]![0]).toMatchObject({ status: 'open', assignedTo: 'u-99' });
+  });
+
+  it('assignTicket rejects an assignee from another partner with 400', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'new', assignedTo: null }]) // ticket
+      .mockResolvedValueOnce([{ id: 'u-evil', partnerId: 'p-OTHER' }]);                                        // assignee
+
+    const err = await assignTicket('t-1', 'u-evil', actor).catch(e => e);
+
+    expect(err).toBeInstanceOf(TicketServiceError);
+    expect(err.status).toBe(400);
+    expect(setMock).not.toHaveBeenCalled();
+  });
+
+  it('assignTicket resolves partner via the org when ticket.partnerId is null (legacy row)', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: null, status: 'new', assignedTo: null }]) // ticket
+      .mockResolvedValueOnce([{ partnerId: 'p-1' }])                                                          // org fallback
+      .mockResolvedValueOnce([{ id: 'u-2', partnerId: 'p-1' }]);                                              // assignee
+    dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', assignedTo: 'u-2', status: 'open' }]);
+
+    const t = await assignTicket('t-1', 'u-2', actor);
+    expect(t?.assignedTo).toBe('u-2');
+  });
+
+  it('assignTicket skips validation when unassigning (null assignee)', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', assignedTo: 'u-2' }]); // ticket only
+    dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', assignedTo: null }]);
+
+    const t = await assignTicket('t-1', null, actor);
+    expect(t?.assignedTo).toBeNull();
+    expect(dbMocks.selectResult).toHaveBeenCalledTimes(1); // no user lookup
   });
 });

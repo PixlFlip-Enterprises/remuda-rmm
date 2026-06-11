@@ -59,7 +59,12 @@ vi.mock('../../middleware/auth', () => ({
     }
     await next();
   },
-  requirePermission: () => async (_c: any, next: any) => next()
+  requirePermission: () => async (_c: any, next: any) => next(),
+  siteAccessCheck: (allowedSiteIds?: string[]) => (siteId?: string | null) => {
+    if (!allowedSiteIds) return true;
+    if (!siteId) return false;
+    return allowedSiteIds.includes(siteId);
+  },
 }));
 
 vi.mock('../../db', () => ({
@@ -118,7 +123,7 @@ vi.mock('../../db/schema', () => ({
   ticketCategories: {},
   ticketAlertLinks: { ticketId: 'ticketId', alertId: 'alertId', id: 'id', linkType: 'linkType' },
   alerts: { id: 'id', title: 'title', severity: 'severity', status: 'status' },
-  devices: { id: 'id', hostname: 'hostname', orgId: 'orgId' },
+  devices: { id: 'id', hostname: 'hostname', orgId: 'orgId', siteId: 'siteId' },
   organizations: { id: 'id', name: 'name' },
   users: { id: 'id', name: 'name' }
 }));
@@ -814,6 +819,187 @@ describe('POST /tickets/bulk', () => {
     const res = await post({ ticketIds: [T1], action: 'assign' });
     expect(res.status).toBe(400);
     expect(serviceMocks.assignTicket).not.toHaveBeenCalled();
+  });
+});
+
+describe('site-axis scoping — per-ticket routes', () => {
+  const SITE_AUTH = {
+    ...DEFAULT_AUTH,
+    scope: 'organization' as string,
+    orgId: 'org-1' as string | null,
+    partnerId: null as string | null,
+    allowedSiteIds: ['site-1']
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = SITE_AUTH as typeof authRef.current;
+  });
+
+  it('GET /tickets/:id returns 404 for a ticket whose device is outside the caller sites', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                            // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(404);
+  });
+
+  it('GET /tickets/:id returns 404 when the ticket device has no site (restricted caller)', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: null }]);                                    // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(404);
+  });
+
+  it('GET /tickets/:id keeps deviceless tickets visible to site-restricted callers', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: null }]) // ticket fetch
+      .mockResolvedValueOnce([{ orgName: 'Org', deviceHostname: null, assigneeName: null }]) // decoration
+      .mockResolvedValueOnce([]); // alert links
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('POST /tickets/:id/assign is blocked (404) for an out-of-site ticket', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                            // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/assign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assigneeId: null })
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.assignTicket).not.toHaveBeenCalled();
+  });
+
+  it('GET /tickets/:id returns 404 for a device-bound ticket when the allowlist is empty', async () => {
+    authRef.current = { ...SITE_AUTH, allowedSiteIds: [] } as typeof authRef.current;
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-1' }]);                                // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(404);
+  });
+
+  it('unrestricted callers (no allowedSiteIds) skip the device lookup entirely', async () => {
+    authRef.current = { ...DEFAULT_AUTH } as typeof authRef.current; // partner scope, unrestricted
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, deviceId: 'd-1' }])                                  // ticket fetch
+      .mockResolvedValueOnce([{ orgName: 'Org', deviceHostname: 'host', assigneeName: null }])       // decoration
+      .mockResolvedValueOnce([]);                                                                     // alert links
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('site-axis scoping — list and stats', () => {
+  const SITE_AUTH = {
+    ...DEFAULT_AUTH,
+    scope: 'organization' as string,
+    orgId: 'org-1' as string | null,
+    partnerId: null as string | null,
+    allowedSiteIds: ['site-1']
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = SITE_AUTH as typeof authRef.current;
+  });
+
+  it('GET /tickets returns 403 when filtering by an out-of-site deviceId', async () => {
+    dbSelectMock.mockResolvedValueOnce([{ siteId: 'site-OTHER' }]); // device lookup
+    const res = await makeApp().request('/tickets?deviceId=9a8b7c6d-2222-4333-8444-555566667777');
+    expect(res.status).toBe(403);
+    expect(await res.json()).toHaveProperty('error', 'Device not found or access denied');
+  });
+
+  it('GET /tickets returns 403 when filtering by a nonexistent deviceId', async () => {
+    dbSelectMock.mockResolvedValueOnce([]); // device lookup
+    const res = await makeApp().request('/tickets?deviceId=9a8b7c6d-2222-4333-8444-555566667777');
+    expect(res.status).toBe(403);
+  });
+
+  it('GET /tickets succeeds for a site-restricted caller (condition applied, no crash)', async () => {
+    dbSelectMock.mockResolvedValue([]); // list rows (subquery is built, never executed)
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual([]);
+  });
+
+  it('GET /tickets/stats succeeds for a site-restricted caller', async () => {
+    dbGroupByMock.mockResolvedValue([
+      { status: 'open', assignedTo: 'u-1', breached: false, count: 2 }
+    ]);
+    const res = await makeApp().request('/tickets/stats');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toMatchObject({ open: 2, mine: 2 });
+  });
+});
+
+describe('site-axis scoping — write guards', () => {
+  const SITE_AUTH = {
+    ...DEFAULT_AUTH,
+    scope: 'organization' as string,
+    orgId: 'org-1' as string | null,
+    partnerId: null as string | null,
+    allowedSiteIds: ['site-1']
+  };
+  const DEVICE_ID = '9a8b7c6d-2222-4333-8444-555566667777';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = SITE_AUTH as typeof authRef.current;
+  });
+
+  it('POST /tickets returns 403 for a deviceId outside the caller sites', async () => {
+    dbSelectMock.mockResolvedValueOnce([{ siteId: 'site-OTHER' }]); // device lookup
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'x', deviceId: DEVICE_ID })
+    });
+    expect(res.status).toBe(403);
+    expect(serviceMocks.createTicket).not.toHaveBeenCalled();
+  });
+
+  it('POST /tickets allows a deviceless create for a site-restricted caller', async () => {
+    serviceMocks.createTicket.mockResolvedValue({ id: 't-1', orgId: ORG_ID, internalNumber: 'T-2026-0042' });
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'x' })
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it('PATCH /tickets/:id returns 403 when moving a ticket onto an out-of-site device', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: null }]) // ticket fetch (in scope: deviceless)
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                           // new device lookup
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID })
+    });
+    expect(res.status).toBe(403);
+    expect(serviceMocks.updateTicketFields).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /tickets/:id allows clearing the device (null) without a new-device lookup', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-1' }]);                                // existing device gate (Task 5)
+    serviceMocks.updateTicketFields.mockResolvedValue({ ...STUB_TICKET, deviceId: null });
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: null })
+    });
+    expect(res.status).toBe(200);
   });
 });
 

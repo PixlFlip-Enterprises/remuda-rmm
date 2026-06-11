@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { and, asc, desc, eq, ilike, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
 import { tickets, ticketComments, ticketAlertLinks, devices, organizations, users, alerts } from '../../db/schema';
-import { requireScope, requirePermission } from '../../middleware/auth';
+import { requireScope, requirePermission, siteAccessCheck } from '../../middleware/auth';
 import { PERMISSIONS } from '../../services/permissions';
 import {
   createTicketSchema, updateTicketSchema, changeTicketStatusSchema,
@@ -54,6 +54,8 @@ function handleServiceError(c: { json: (b: unknown, s: number) => Response }, er
  * - organization scope: adds eq(orgId); null orgId treated as not-found
  * - partner scope: adds eq(partnerId, auth.partnerId); null partnerId as not-found
  * - system scope: no extra condition (unrestricted)
+ * - site axis: device-bound tickets are additionally gated by the caller's
+ *   `allowedSiteIds` allowlist (see deviceInSiteScope).
  */
 export async function getScopedTicketOr404(
   auth: AuthContext,
@@ -76,7 +78,53 @@ export async function getScopedTicketOr404(
     .where(and(...conditions))
     .limit(1);
 
-  return rows[0] ?? null;
+  const ticket = rows[0] ?? null;
+  if (!ticket) return null;
+
+  // Site-axis restriction (spec §7): a device-bound ticket is visible only when
+  // its device's site is in the caller's allowlist. Deviceless (org-level)
+  // tickets stay visible — they aren't site-bound (matches alerts semantics).
+  if (ticket.deviceId && !(await deviceInSiteScope(auth, ticket.deviceId))) {
+    return null;
+  }
+  return ticket;
+}
+
+/**
+ * Site-axis (sub-org) device gate. `auth.allowedSiteIds` is only populated for
+ * organization-scope users with a site restriction — everyone else passes.
+ * A restricted caller is denied for a device with no site assignment
+ * (matches siteAccessCheck semantics in middleware/auth.ts).
+ */
+async function deviceInSiteScope(auth: AuthContext, deviceId: string): Promise<boolean> {
+  if (!auth.allowedSiteIds) return true;
+  const rows = await db
+    .select({ siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+  return siteAccessCheck(auth.allowedSiteIds)(rows[0]?.siteId);
+}
+
+/**
+ * Site-axis list condition (spec §7): device-bound tickets are limited to
+ * devices in the caller's allowed sites; deviceless (org-level) tickets stay
+ * visible. Uses an IN-subquery on devices instead of a join so the same
+ * condition works for the list, count, and stats queries unchanged. Empty
+ * allowlist = deviceless tickets only. Returns undefined for unrestricted
+ * callers (partner/system scope, or org users without a site restriction).
+ */
+function ticketSiteScopeCondition(auth: AuthContext): SQL | undefined {
+  const allowed = auth.allowedSiteIds;
+  if (!allowed) return undefined;
+  if (allowed.length === 0) return isNull(tickets.deviceId);
+  return or(
+    isNull(tickets.deviceId),
+    inArray(
+      tickets.deviceId,
+      db.select({ id: devices.id }).from(devices).where(inArray(devices.siteId, allowed))
+    )
+  )!;
 }
 
 /** Sentinel returned by buildScopeConditions when the caller context is broken. */
@@ -116,6 +164,10 @@ ticketsRoutes.get(
       return c.json({ error: 'Partner context required' }, 403);
     }
     const conditions: SQL[] = scopeResult;
+    // Site-axis restriction: stats must not leak counts for out-of-site
+    // device-bound tickets (deviceless tickets remain counted).
+    const siteCondition = ticketSiteScopeCondition(auth);
+    if (siteCondition) conditions.push(siteCondition);
     const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
 
     const rows = await db
@@ -164,7 +216,17 @@ ticketsRoutes.get(
       conditions.push(eq(tickets.partnerId, auth.partnerId));
     }
     if (q.orgId) conditions.push(eq(tickets.orgId, q.orgId));
-    if (q.deviceId) conditions.push(eq(tickets.deviceId, q.deviceId));
+    if (q.deviceId) {
+      // Site gate on the explicit device filter (alerts pattern): a restricted
+      // caller asking for a device outside their sites gets a hard 403, not an
+      // empty list, so the failure is visible.
+      if (!(await deviceInSiteScope(auth, q.deviceId))) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      conditions.push(eq(tickets.deviceId, q.deviceId));
+    }
+    const siteCondition = ticketSiteScopeCondition(auth);
+    if (siteCondition) conditions.push(siteCondition);
     if (q.status) conditions.push(eq(tickets.status, q.status));
     else if (q.statusGroup === 'open') conditions.push(inArray(tickets.status, [...OPEN_STATUSES]));
     else if (q.statusGroup === 'closed') conditions.push(inArray(tickets.status, [...CLOSED_STATUSES]));
@@ -242,6 +304,13 @@ ticketsRoutes.post(
     // Mirror the alerts/rules convention: verify the caller can reach the target org.
     if (!auth.canAccessOrg(body.orgId)) {
       return c.json({ error: 'Access to this organization denied' }, 403);
+    }
+
+    // Site-axis guard: a site-restricted caller may only open device-bound
+    // tickets for devices in their allowed sites (deviceless org-level tickets
+    // are fine — they aren't site-bound).
+    if (body.deviceId && !(await deviceInSiteScope(auth, body.deviceId))) {
+      return c.json({ error: 'Device not found or access denied' }, 403);
     }
 
     try {
@@ -330,6 +399,12 @@ ticketsRoutes.patch(
     }
     const found = await getScopedTicketOr404(auth, id);
     if (!found) return c.json({ error: 'Ticket not found' }, 404);
+
+    // Site-axis guard on the NEW device (the existing ticket's device was
+    // already gated by getScopedTicketOr404 above).
+    if (typeof body.deviceId === 'string' && !(await deviceInSiteScope(auth, body.deviceId))) {
+      return c.json({ error: 'Device not found or access denied' }, 403);
+    }
 
     try {
       const ticket = await updateTicketFields(id, body, actorFrom(c));
