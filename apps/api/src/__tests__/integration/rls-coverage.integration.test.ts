@@ -74,6 +74,11 @@ const ORG_AXIS_POLICY_EXCLUDED_TABLES: ReadonlySet<string> = new Set<string>([
   // org_id is retained for ops/audit attribution only; the RLS policy uses
   // breeze_current_user_id(), not breeze_has_org_access.
   'account_deletion_requests',
+  // Huntress credentials and discovered-org mappings are partner-scoped.
+  // org_id is retained only as legacy/mapping metadata and may be NULL for
+  // quarantined Huntress orgs.
+  'huntress_integrations',
+  'huntress_org_mappings',
 ]);
 
 // Tables whose own `id` column is the tenant identifier (no `org_id`).
@@ -92,6 +97,8 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
   ['email_verification_tokens', 'partner_id'],
   ['ticket_categories', 'partner_id'],
   ['partner_ticket_sequences', 'partner_id'],
+  ['huntress_integrations', 'partner_id'],
+  ['huntress_org_mappings', 'partner_id'],
 ]);
 
 // Tables whose policies reference both helpers (org OR partner). `users`
