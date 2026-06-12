@@ -6,6 +6,7 @@ import { allocateInternalTicketNumber } from './ticketNumbers';
 import { emitTicketEvent } from './ticketEvents';
 import { createAuditLogAsync } from './auditService';
 import { resolveSlaTargets } from './ticketSla';
+import { getOrgSlaOverride, getPartnerPrioritySla, getSystemStatusId, getTicketStatusById } from './ticketConfigService';
 
 export type TicketStatus = (typeof ticketStatusEnum.enumValues)[number];
 export type TicketSource = (typeof ticketSourceEnum.enumValues)[number];
@@ -33,7 +34,10 @@ export type TicketServiceErrorCode =
   | 'CATEGORY_WRONG_PARTNER'
   | 'TICKET_PARTNER_UNRESOLVABLE'
   | 'INVALID_TRANSITION'
-  | 'CONCURRENT_MODIFICATION';
+  | 'CONCURRENT_MODIFICATION'
+  | 'STATUS_NOT_FOUND'
+  | 'STATUS_INACTIVE'
+  | 'INVALID_INPUT';
 
 export class TicketServiceError extends Error {
   constructor(
@@ -216,10 +220,23 @@ export async function createTicket(input: CreateTicketInput, actor: TicketActor)
     category = await assertCategoryInPartner(input.categoryId, org.partnerId);
   }
 
+  const priority = input.priority ?? 'normal';
+  const initialCoreStatus: TicketStatus = input.assigneeId ? 'open' : 'new';
+
+  const [orgSla, partnerSla, statusId] = await Promise.all([
+    getOrgSlaOverride(input.orgId, priority),
+    getPartnerPrioritySla(org.partnerId, priority),
+    getSystemStatusId(org.partnerId, initialCoreStatus),
+  ]);
+
   const slaTargets = resolveSlaTargets({
     categoryResponseMinutes: category?.responseSlaMinutes ?? null,
     categoryResolutionMinutes: category?.resolutionSlaMinutes ?? null,
-    priority: input.priority ?? 'normal'
+    orgResponseMinutes: orgSla.responseMinutes,
+    orgResolutionMinutes: orgSla.resolutionMinutes,
+    partnerResponseMinutes: partnerSla.responseMinutes,
+    partnerResolutionMinutes: partnerSla.resolutionMinutes,
+    priority
   });
 
   const internalNumber = await allocateInternalTicketNumber(org.partnerId);
@@ -234,10 +251,11 @@ export async function createTicket(input: CreateTicketInput, actor: TicketActor)
     description: input.description ?? null,
     deviceId: input.deviceId ?? null,
     categoryId: input.categoryId ?? null,
-    priority: input.priority ?? 'normal',
+    priority,
     dueDate: input.dueDate ?? null,
     assignedTo: input.assigneeId ?? null,
-    status: (input.assigneeId ? 'open' : 'new') as typeof tickets.$inferInsert['status'],
+    status: initialCoreStatus,
+    statusId: statusId ?? null,
     source: input.source,
     submittedBy: isPortal ? input.submittedBy : null,
     // Non-portal tickets show the acting user as the requester NAME only (fixes
@@ -284,16 +302,99 @@ export interface ChangeStatusOptions {
   pendingReason?: string;
 }
 
+export interface ChangeStatusTarget {
+  status?: TicketStatus;
+  statusId?: string;
+}
+
 export async function changeTicketStatus(
   ticketId: string,
-  toStatus: TicketStatus,
+  target: ChangeStatusTarget,
   opts: ChangeStatusOptions,
   actor: TicketActor
 ) {
   const ticket = await getTicketOrThrow(ticketId);
   const fromStatus = ticket.status as TicketStatus;
 
-  if (fromStatus === toStatus) return ticket;
+  // Validate target: exactly one of status/statusId must be set
+  const hasStatus = target.status !== undefined;
+  const hasStatusId = target.statusId !== undefined;
+  if ((hasStatus && hasStatusId) || (!hasStatus && !hasStatusId)) {
+    throw new TicketServiceError('Provide exactly one of status or statusId', 400, 'INVALID_INPUT');
+  }
+
+  let toStatus: TicketStatus;
+  let resolvedStatusId: string | null | undefined;
+  let customStatusName: string | undefined;
+
+  const partnerId = await resolveTicketPartnerId(ticket);
+
+  if (hasStatusId) {
+    const row = await getTicketStatusById(target.statusId!);
+    if (!row) throw new TicketServiceError('Status not found', 404, 'STATUS_NOT_FOUND');
+    if (row.partnerId !== partnerId) throw new TicketServiceError('Status not found', 404, 'STATUS_NOT_FOUND');
+    if (!row.isActive) throw new TicketServiceError('Status is inactive', 400, 'STATUS_INACTIVE');
+    toStatus = row.coreStatus;
+    resolvedStatusId = target.statusId;
+    customStatusName = row.name;
+  } else {
+    toStatus = target.status!;
+    resolvedStatusId = partnerId ? await getSystemStatusId(partnerId, toStatus) : null;
+    customStatusName = undefined;
+  }
+
+  // No-op: same core status AND same statusId
+  if (toStatus === fromStatus && resolvedStatusId === ticket.statusId) return ticket;
+
+  // Same core status but different statusId — update statusId only (skip FSM validation)
+  if (toStatus === fromStatus) {
+    const now = new Date();
+    const patch: Partial<typeof tickets.$inferInsert> = { statusId: resolvedStatusId ?? null, updatedAt: now };
+    const updated = await db
+      .update(tickets)
+      .set(patch)
+      .where(and(
+        eq(tickets.id, ticketId),
+        eq(tickets.status, fromStatus),
+        ticket.statusId ? eq(tickets.statusId, ticket.statusId) : isNull(tickets.statusId)
+      ))
+      .returning();
+    if (updated.length === 0) {
+      throw new TicketServiceError('Ticket was modified concurrently', 409, 'CONCURRENT_MODIFICATION');
+    }
+    // Only write a feed entry when there is meaningful content — i.e. the caller
+    // supplied a custom status name (statusId path).  A legacy {status} call that
+    // happens to resolve to the same core value but swaps the statusId back to the
+    // system row produces an empty content and identical oldValue/newValue, which
+    // would be a no-op noise row in the feed.
+    if (customStatusName) {
+      await db.insert(ticketComments).values({
+        ticketId,
+        userId: actor.userId,
+        authorName: actor.name ?? null,
+        authorType: 'internal',
+        commentType: 'status_change',
+        content: customStatusName,
+        isPublic: false,
+        oldValue: fromStatus,
+        newValue: toStatus
+      });
+    }
+    // Do NOT emit ticket.status_changed — core status is unchanged; only the
+    // custom-status label (statusId) differs.  Emitting with identical from/to
+    // would produce noise and confuse downstream consumers.
+    await createAuditLogAsync({
+      orgId: ticket.orgId,
+      actorId: actor.userId,
+      action: 'ticket.status_change',
+      resourceType: 'ticket',
+      resourceId: ticketId,
+      details: { from: fromStatus, to: toStatus },
+      result: 'success'
+    });
+    return updated[0];
+  }
+
   if (!TICKET_STATUS_TRANSITIONS[fromStatus]?.includes(toStatus)) {
     throw new TicketServiceError(`Cannot transition ticket from ${fromStatus} to ${toStatus}`, 409, 'INVALID_TRANSITION');
   }
@@ -302,7 +403,7 @@ export async function changeTicketStatus(
   }
 
   const now = new Date();
-  const patch: Partial<typeof tickets.$inferInsert> = { status: toStatus, updatedAt: now };
+  const patch: Partial<typeof tickets.$inferInsert> = { status: toStatus, statusId: resolvedStatusId ?? null, updatedAt: now };
 
   if (toStatus === 'resolved') {
     patch.resolvedAt = ticket.resolvedAt ?? now;
@@ -357,7 +458,7 @@ export async function changeTicketStatus(
     authorName: actor.name ?? null,
     authorType: 'internal',
     commentType: 'status_change',
-    content: opts.resolutionNote ?? opts.pendingReason ?? '',
+    content: opts.resolutionNote ?? opts.pendingReason ?? customStatusName ?? '',
     isPublic: false,
     oldValue: fromStatus,
     newValue: toStatus
