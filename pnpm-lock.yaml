@@ -407,8 +407,8 @@ importers:
         specifier: 0.86.0
         version: 0.86.0(@babel/core@7.29.7)(@react-native-community/cli@12.1.1)(@react-native/metro-config@0.86.0(@babel/core@7.29.7))(@types/react@19.2.17)(react@19.2.7)
       react-native-gesture-handler:
-        specifier: ~2.31.2
-        version: 2.31.2(react-native@0.86.0(@babel/core@7.29.7)(@react-native-community/cli@12.1.1)(@react-native/metro-config@0.86.0(@babel/core@7.29.7))(@types/react@19.2.17)(react@19.2.7))(react@19.2.7)
+        specifier: ~2.32.0
+        version: 2.32.0(react-native@0.86.0(@babel/core@7.29.7)(@react-native-community/cli@12.1.1)(@react-native/metro-config@0.86.0(@babel/core@7.29.7))(@types/react@19.2.17)(react@19.2.7))(react@19.2.7)
       react-native-markdown-display:
         specifier: ^7.0.2
         version: 7.0.2(react-native@0.86.0(@babel/core@7.29.7)(@react-native-community/cli@12.1.1)(@react-native/metro-config@0.86.0(@babel/core@7.29.7))(@types/react@19.2.17)(react@19.2.7))(react@19.2.7)
@@ -8217,8 +8217,8 @@ packages:
   react-native-fit-image@1.5.5:
     resolution: {integrity: sha512-Wl3Vq2DQzxgsWKuW4USfck9zS7YzhvLNPpkwUUCF90bL32e1a0zOVQ3WsJILJOwzmPdHfzZmWasiiAUNBkhNkg==}
 
-  react-native-gesture-handler@2.31.2:
-    resolution: {integrity: sha512-rw5q74i2AfS7YGYdbxQDhOU7xqgY6WRM1132/CCm3erqjblhECZDZFHIm0tteHoC9ih24wogVBVVzcTBQtZ+5A==}
+  react-native-gesture-handler@2.32.0:
+    resolution: {integrity: sha512-uYIMOKlKENORq2SABE+jIjbPU+h5I/sQKcq2v16zRq848nwEp1fWRVwML4QWqijc8UcXJC25o54S8GQd4Mf2OA==}
     peerDependencies:
       react: '*'
       react-native: '*'
@@ -18715,7 +18715,7 @@ snapshots:
     dependencies:
       prop-types: 15.8.1
 
-  react-native-gesture-handler@2.31.2(react-native@0.86.0(@babel/core@7.29.7)(@react-native-community/cli@12.1.1)(@react-native/metro-config@0.86.0(@babel/core@7.29.7))(@types/react@19.2.17)(react@19.2.7))(react@19.2.7):
+  react-native-gesture-handler@2.32.0(react-native@0.86.0(@babel/core@7.29.7)(@react-native-community/cli@12.1.1)(@react-native/metro-config@0.86.0(@babel/core@7.29.7))(@types/react@19.2.17)(react@19.2.7))(react@19.2.7):
     dependencies:
       '@egjs/hammerjs': 2.0.17
       '@types/react-test-renderer': 19.1.0
