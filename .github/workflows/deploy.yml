@@ -1,0 +1,70 @@
+name: Deploy to self-hosted (remuda)
+
+# Auto-deploy to the self-hosted box (Debian LXC, runs the native systemd
+# stack — no Docker). On every push to main the on-box runner fast-forwards
+# /opt/remuda/app, rebuilds api + web, and restarts the services. The API
+# self-migrates on boot, so no separate migration step is needed here.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: remuda-selfhosted-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Only the canonical repo's runner should ever pick this up.
+    if: github.repository == 'PixlFlip-Enterprises/remuda-rmm'
+    runs-on: [self-hosted, remuda-prod]
+    timeout-minutes: 30
+    steps:
+      - name: Pull, build, and restart
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          APP=/opt/remuda/app
+
+          echo "::group::git sync"
+          # Authenticate the fetch with the ephemeral job token (never stored).
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -C "$APP" -c http.extraheader="AUTHORIZATION: basic $AUTH" fetch --prune origin main
+          git -C "$APP" reset --hard origin/main
+          echo "deploying $(git -C "$APP" rev-parse --short HEAD)"
+          echo "::endgroup::"
+
+          export HOME=/opt/remuda
+          export PATH=/usr/bin:/usr/local/bin:$PATH
+          export NODE_ENV=production
+          export NODE_OPTIONS=--max-old-space-size=3072
+          cd "$APP"
+
+          echo "::group::pnpm install"
+          pnpm install --frozen-lockfile
+          echo "::endgroup::"
+
+          echo "::group::build (api + web)"
+          # --no-dts: .d.ts output is dev-only and OOMs the 4GB box; runtime
+          # only loads dist/index.cjs.
+          pnpm --filter @breeze/api exec tsup --no-dts
+          pnpm --filter @breeze/web build
+          echo "::endgroup::"
+
+          echo "::group::restart"
+          sudo systemctl restart breeze-api
+          sudo systemctl restart breeze-web
+          echo "::endgroup::"
+
+          echo "::group::health gate"
+          ok=0
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-Proto: https' http://127.0.0.1:3001/health || true)
+            if [ "$code" = "200" ]; then ok=1; echo "api healthy after ~$((i*2))s"; break; fi
+            sleep 2
+          done
+          if [ "$ok" != "1" ]; then echo "API did not become healthy"; exit 1; fi
+          web=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4321/ || true)
+          echo "web status: $web"
+          echo "::endgroup::"
