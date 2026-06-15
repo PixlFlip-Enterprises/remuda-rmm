@@ -49,6 +49,10 @@ jobs:
           # --no-dts: .d.ts output is dev-only and OOMs the 4GB box; runtime
           # only loads dist/index.cjs.
           pnpm --filter @breeze/api exec tsup --no-dts
+          # Bake PUBLIC_* (notably PUBLIC_API_URL) into the web client bundle.
+          # Vite inlines import.meta.env.PUBLIC_* at build time; without this the
+          # UI falls back to window.location.origin and emits wrong enrollment links.
+          set -a; . /opt/remuda/shared/web.env; set +a
           pnpm --filter @breeze/web build
           echo "::endgroup::"
 
