@@ -26,6 +26,17 @@ export type InvoiceEvent =
       paymentId: string;
       /** Null for system/background actors (e.g. contract worker). */
       actorUserId?: string | null;
+    }
+  | {
+      // payment.failed can fire BEFORE any invoice_payments row exists (a Stripe
+      // charge that we terminally reject pre-write), so paymentId is optional —
+      // the event still carries the real invoice/org/partner context.
+      type: 'payment.failed';
+      invoiceId: string;
+      orgId: string;
+      partnerId: string;
+      paymentId?: string;
+      actorUserId?: string | null;
     };
 
 let queue: Queue | null = null;
