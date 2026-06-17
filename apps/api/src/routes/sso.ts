@@ -122,7 +122,7 @@ function isValidSsoStateCookie(state: string, cookieHeader: string | undefined):
 // ============================================
 
 const createProviderSchema = z.object({
-  orgId: z.string().uuid().optional(),
+  orgId: z.string().guid().optional(),
   name: z.string().min(1).max(255),
   type: z.enum(['oidc', 'saml']),
   preset: z.string().optional(),
@@ -138,7 +138,7 @@ const createProviderSchema = z.object({
     groups: z.string().optional()
   }).optional(),
   autoProvision: z.boolean().optional(),
-  defaultRoleId: z.string().uuid().optional(),
+  defaultRoleId: z.string().guid().optional(),
   allowedDomains: z.string().optional(),
   enforceSSO: z.boolean().optional()
 });
@@ -353,8 +353,8 @@ function resolveOrgIdForProviderRoute(
   return { error: 'Organization ID required', status: 400 };
 }
 
-const providerIdParamSchema = z.object({ id: z.string().uuid() });
-const orgIdParamSchema = z.object({ orgId: z.string().uuid() });
+const providerIdParamSchema = z.object({ id: z.string().guid() });
+const orgIdParamSchema = z.object({ orgId: z.string().guid() });
 
 // ============================================
 // Provider Management Routes (Admin)
@@ -1049,10 +1049,31 @@ ssoRoutes.get('/callback', async (c) => {
       ))
       .limit(1);
 
-    if (existingIdentity) {
-      await db
-        .update(userSsoIdentities)
-        .set({
+    // System DB context required: the SSO callback is unauthenticated, so these
+    // writes would silently match 0 rows under breeze_app RLS without it —
+    // dropping the SSO identity/token persistence AND the last_login_at stamp
+    // (#1375).
+    await withSystemDbAccessContext(async () => {
+      if (existingIdentity) {
+        await db
+          .update(userSsoIdentities)
+          .set({
+            email: attrs.email,
+            profile: userInfo,
+            accessToken: encryptSecret(tokens.access_token),
+            refreshToken: encryptSecret(tokens.refresh_token),
+            tokenExpiresAt: tokens.expires_in
+              ? new Date(Date.now() + tokens.expires_in * 1000)
+              : null,
+            lastLoginAt: new Date(),
+            updatedAt: new Date()
+          })
+          .where(eq(userSsoIdentities.id, existingIdentity.id));
+      } else {
+        await db.insert(userSsoIdentities).values({
+          userId: user.id,
+          providerId: provider.id,
+          externalId: userInfo.sub,
           email: attrs.email,
           profile: userInfo,
           accessToken: encryptSecret(tokens.access_token),
@@ -1060,31 +1081,16 @@ ssoRoutes.get('/callback', async (c) => {
           tokenExpiresAt: tokens.expires_in
             ? new Date(Date.now() + tokens.expires_in * 1000)
             : null,
-          lastLoginAt: new Date(),
-          updatedAt: new Date()
-        })
-        .where(eq(userSsoIdentities.id, existingIdentity.id));
-    } else {
-      await db.insert(userSsoIdentities).values({
-        userId: user.id,
-        providerId: provider.id,
-        externalId: userInfo.sub,
-        email: attrs.email,
-        profile: userInfo,
-        accessToken: encryptSecret(tokens.access_token),
-        refreshToken: encryptSecret(tokens.refresh_token),
-        tokenExpiresAt: tokens.expires_in
-          ? new Date(Date.now() + tokens.expires_in * 1000)
-          : null,
-        lastLoginAt: new Date()
-      });
-    }
+          lastLoginAt: new Date()
+        });
+      }
 
-    // Update last login
-    await db
-      .update(users)
-      .set({ lastLoginAt: new Date() })
-      .where(eq(users.id, user.id));
+      // Update last login
+      await db
+        .update(users)
+        .set({ lastLoginAt: new Date() })
+        .where(eq(users.id, user.id));
+    });
 
     // The SSO session row was already consumed atomically up-front
     // (delete().returning()), so there is nothing left to clean up here.

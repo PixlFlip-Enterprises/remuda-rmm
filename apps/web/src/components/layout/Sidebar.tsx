@@ -7,6 +7,10 @@ import {
   ShieldAlert,
   Terminal,
   FileText,
+  FileSignature,
+  Receipt,
+  Tags,
+  FileSpreadsheet,
   Building,
   Building2,
   Filter,
@@ -41,7 +45,9 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useUiStore } from '../../stores/uiStore';
+import type { PermissionGrant } from '@breeze/shared';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { hasPermission } from '../../lib/permissions';
 import { WEB_VERSION } from '../../lib/version';
 import { semverCompare } from '@breeze/shared';
 import { getJwtClaims } from '../../lib/authScope';
@@ -84,6 +90,19 @@ type NavItem = {
   // Hidden unless the current user is a platform admin. Keeps cross-tenant
   // platform-operator nav (and its badge fetch) out of ordinary users' UI.
   platformAdminOnly?: boolean;
+  // Hidden when the JWT decodes to a non-partner scope (AI for Office is an
+  // MSP-admin surface). Client-side UX nicety only — same rationale as the
+  // partner-branding fetch below; undecodable tokens fall through to visible
+  // and the server re-checks everything.
+  partnerScopeOnly?: boolean;
+  // Shown only when the current partner has AI for Office enabled (runtime flag
+  // from /orgs/partners/me). Undefined means not gated on the partner flag.
+  requiresAiForOffice?: boolean;
+  // Hidden unless the user holds this permission (e.g. billing nav gated on
+  // invoices:read). UX only — the route still enforces it server-side. While
+  // the permission set is still loading, the item stays hidden. Typed as the
+  // exact-pair union so a typo'd resource/action fails to compile.
+  requiredPermission?: PermissionGrant;
 };
 
 // ---------------------------------------------------------------------------
@@ -119,6 +138,7 @@ export const navSections: NavSection[] = [
     items: [
       { name: 'Fleet', href: '/fleet', icon: BrainCircuit },
       { name: 'AI Workspace', href: '/workspace', icon: MessagesSquare },
+      { name: 'AI for Office', href: '/ai-for-office', icon: FileSpreadsheet, partnerScopeOnly: true, requiresAiForOffice: true },
     ],
   },
   {
@@ -150,6 +170,10 @@ export const navSections: NavSection[] = [
     label: 'Operations',
     icon: Layers,
     items: [
+      { name: 'Quotes', href: '/billing/quotes', icon: FileText, partnerScopeOnly: true, requiredPermission: { resource: 'quotes', action: 'read' } },
+      { name: 'Invoices', href: '/billing/invoices', icon: Receipt, partnerScopeOnly: true, requiredPermission: { resource: 'invoices', action: 'read' } },
+      { name: 'Contracts', href: '/contracts', icon: FileSignature, partnerScopeOnly: true, requiredPermission: { resource: 'contracts', action: 'read' } },
+      { name: 'Product Catalog', href: '/settings/catalog', icon: Tags, partnerScopeOnly: true, requiredPermission: { resource: 'catalog', action: 'read' } },
       { name: 'Software Library', href: '/software', icon: Package },
       { name: 'Software Policies', href: '/software-inventory', icon: Package },
       { name: 'Config Policies', href: '/configuration-policies', icon: Layers },
@@ -281,6 +305,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   const [hovered, setHovered] = useState(false);
   const currentPath = useCurrentPath(initialPath);
   const isPlatformAdmin = useAuthStore((s) => s.user?.isPlatformAdmin === true);
+  const permissions = useAuthStore((s) => s.user?.permissions);
 
   // --- Responsive breakpoints -----------------------------------------------
   // Track whether viewport is below lg (1024px) or md (768px) to override mode
@@ -290,6 +315,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
 
   const [brandName, setBrandName] = useState<string | null>(null);
   const [brandLogoUrl, setBrandLogoUrl] = useState<string | null>(null);
+  const [aiForOfficeEnabled, setAiForOfficeEnabled] = useState(false);
 
   const [apiVersion, setApiVersion] = useState<string | null>(null);
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
@@ -331,12 +357,13 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
           }
           return null;
         }
-        return r.json() as Promise<{ name?: string; settings?: { branding?: { logoUrl?: string } } }>;
+        return r.json() as Promise<{ name?: string; aiForOfficeEnabled?: boolean; settings?: { branding?: { logoUrl?: string } } }>;
       })
       .then((data) => {
         if (cancelled || !data) return;
         setBrandName(data.name ?? null);
         setBrandLogoUrl(data.settings?.branding?.logoUrl ?? null);
+        setAiForOfficeEnabled(data.aiForOfficeEnabled === true);
       })
       .catch((err) => {
         console.warn('[Sidebar] Failed to fetch partner branding:', err);
@@ -434,7 +461,17 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
 
   // --- Render a single nav item -------------------------------------------
   const renderNavItem = (item: NavItem, forMobileOverlay = false) => {
+    if (item.requiresAiForOffice && !aiForOfficeEnabled) return null;
     if (item.platformAdminOnly && !isPlatformAdmin) return null;
+    if (item.partnerScopeOnly) {
+      const { scope } = getJwtClaims();
+      if (scope !== null && scope !== 'partner') return null;
+    }
+    if (item.requiredPermission) {
+      if (!hasPermission(permissions, item.requiredPermission.resource, item.requiredPermission.action)) {
+        return null;
+      }
+    }
     const isActive = item.href === activeHref;
     const labels = forMobileOverlay ? true : showLabels;
     const narrow = forMobileOverlay ? false : isNarrow;

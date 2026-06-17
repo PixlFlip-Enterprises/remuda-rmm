@@ -327,7 +327,7 @@ const envSchema = z
   .object({
     // -- Required (always) ---------------------------------------------------
     DATABASE_URL: z
-      .string({ required_error: 'DATABASE_URL is required' })
+      .string({ error: 'DATABASE_URL is required' })
       .min(1, 'DATABASE_URL must not be empty')
       .refine((url) => url.startsWith('postgresql://') || url.startsWith('postgres://'), {
         message: 'DATABASE_URL must be a valid postgres:// or postgresql:// URL',
@@ -364,7 +364,7 @@ const envSchema = z
       .describe('Optional dedicated connection for the breeze_audit_admin role (audit retention worker, issue #915). If unset, retention uses the legacy breeze_app + SET ROLE path.'),
 
     JWT_SECRET: z
-      .string({ required_error: 'JWT_SECRET is required' })
+      .string({ error: 'JWT_SECRET is required' })
       .min(1, 'JWT_SECRET must not be empty'),
 
     // Optional: zero-downtime JWT signing key rotation via kid header.
@@ -378,11 +378,11 @@ const envSchema = z
     E2E_MODE: z.string().optional(),
 
     APP_ENCRYPTION_KEY: z
-      .string({ required_error: 'APP_ENCRYPTION_KEY is required' })
+      .string({ error: 'APP_ENCRYPTION_KEY is required' })
       .min(1, 'APP_ENCRYPTION_KEY must not be empty'),
 
     MFA_ENCRYPTION_KEY: z
-      .string({ required_error: 'MFA_ENCRYPTION_KEY is required' })
+      .string({ error: 'MFA_ENCRYPTION_KEY is required' })
       .min(1, 'MFA_ENCRYPTION_KEY must not be empty'),
 
     // -- Production-required -------------------------------------------------
@@ -431,6 +431,12 @@ const envSchema = z
     BREEZE_BILLING_API_KEY: z.string().optional(),
     BILLING_SERVICE_URL: z.string().optional(),
     BILLING_SERVICE_API_KEY: z.string().optional(),
+
+    // Stripe Connect payments (billing sub-project 4) — feature dormant unless set.
+    STRIPE_SECRET_KEY: z.string().optional(),
+    STRIPE_CONNECT_CLIENT_ID: z.string().optional(),
+    STRIPE_WEBHOOK_SECRET: z.string().optional(),
+    STRIPE_OAUTH_REDIRECT_URL: z.string().optional(),
 
     // S3 / object storage — required when S3_BUCKET is set.
     S3_BUCKET: z.string().optional(),
@@ -1196,6 +1202,10 @@ export function validateConfig(): AppConfig {
     BREEZE_BILLING_API_KEY: env.BREEZE_BILLING_API_KEY,
     BILLING_SERVICE_URL: env.BILLING_SERVICE_URL,
     BILLING_SERVICE_API_KEY: env.BILLING_SERVICE_API_KEY,
+    STRIPE_SECRET_KEY: env.STRIPE_SECRET_KEY,
+    STRIPE_CONNECT_CLIENT_ID: env.STRIPE_CONNECT_CLIENT_ID,
+    STRIPE_WEBHOOK_SECRET: env.STRIPE_WEBHOOK_SECRET,
+    STRIPE_OAUTH_REDIRECT_URL: env.STRIPE_OAUTH_REDIRECT_URL,
     S3_BUCKET: env.S3_BUCKET,
     S3_ACCESS_KEY: env.S3_ACCESS_KEY,
     S3_SECRET_KEY: env.S3_SECRET_KEY,

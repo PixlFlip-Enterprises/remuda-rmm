@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, customType } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, integer, pgEnum, customType, primaryKey } from 'drizzle-orm/pg-core';
 import { partners, organizations } from './orgs';
 
 // Postgres `bytea` mapped to a Node Buffer. postgres.js returns bytea columns
@@ -32,6 +32,10 @@ export const users = pgTable('users', {
   mfaSecret: text('mfa_secret'),
   mfaEnabled: boolean('mfa_enabled').notNull().default(false),
   mfaRecoveryCodes: jsonb('mfa_recovery_codes'),
+  approverPinHash: text('approver_pin_hash'),
+  approverPinSetAt: timestamp('approver_pin_set_at', { withTimezone: true }),
+  approverPinFailedCount: integer('approver_pin_failed_count').notNull().default(0),
+  approverPinLockedUntil: timestamp('approver_pin_locked_until', { withTimezone: true }),
   phoneNumber: text('phone_number'),
   phoneVerified: boolean('phone_verified').notNull().default(false),
   mfaMethod: mfaMethodEnum('mfa_method'),
@@ -94,7 +98,11 @@ export const rolePermissions = pgTable('role_permissions', {
   roleId: uuid('role_id').notNull().references(() => roles.id),
   permissionId: uuid('permission_id').notNull().references(() => permissions.id),
   constraints: jsonb('constraints')
-});
+}, (t) => ({
+  // A role holds a given permission at most once. Composite PK both de-dups and
+  // makes the seed's ON-conflict (23505) path real, so re-seeding is idempotent.
+  pk: primaryKey({ columns: [t.roleId, t.permissionId] })
+}));
 
 export const partnerUsers = pgTable('partner_users', {
   id: uuid('id').primaryKey().defaultRandom(),

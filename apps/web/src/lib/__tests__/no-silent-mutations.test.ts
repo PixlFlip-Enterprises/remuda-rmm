@@ -55,7 +55,20 @@ const TARGET_GLOBS = [
   'src/components/time/TimesheetPage.tsx',
   'src/components/tickets/TicketTimeBilling.tsx',
   'src/components/tickets/TicketPartsCard.tsx',
+  'src/components/clientAi/OrgsTab.tsx',
+  'src/components/clientAi/PolicyEditor.tsx',
+  'src/components/clientAi/SessionsTab.tsx',
+  'src/components/clientAi/TemplatesTab.tsx',
   'src/components/settings/CatalogItemsTab.tsx',
+  'src/components/billing/InvoicesPage.tsx',
+  'src/components/billing/InvoiceEditor.tsx',
+  'src/components/billing/InvoiceDetail.tsx',
+  'src/components/billing/PartnerBillingSettings.tsx',
+  'src/components/billing/OrgBillingSettings.tsx',
+  'src/components/contracts/ContractEditor.tsx',
+  'src/components/contracts/ContractDetail.tsx',
+  'src/components/billing/quotes/QuotesPage.tsx',
+  'src/components/billing/quotes/QuoteEditor.tsx',
 ];
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
@@ -247,7 +260,7 @@ describe('migration backlog integrity', () => {
 // ─── Main guard ─────────────────────────────────────────────────────────────
 describe('no silent mutations in targeted set', () => {
   it('finds files to scan', () => {
-    expect(absoluteFiles.length).toBe(28);
+    expect(absoluteFiles.length).toBe(41);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }

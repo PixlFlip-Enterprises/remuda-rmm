@@ -11,20 +11,22 @@
     "test:report": "playwright show-report",
     "doc-verify": "tsx doc-verify/cli.ts",
     "doc-verify:extract": "tsx doc-verify/cli.ts extract",
-    "doc-verify:run": "tsx doc-verify/cli.ts run"
+    "doc-verify:run": "tsx doc-verify/cli.ts run",
+    "monitor": "tsx live-signup/monitor.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
     "dotenv": "^17.4.2"
   },
   "devDependencies": {
-    "@playwright/test": "^1.60.0",
-    "@types/node": "^25.9.2",
+    "@playwright/test": "^1.61.0",
+    "@types/node": "^25.9.3",
     "@types/pg": "^8.20.0",
     "pg": "^8.21.0",
     "playwright": "^1.58.2",
     "tsx": "^4.22.4",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

@@ -15,6 +15,7 @@ import { secureHeaders } from 'hono/secure-headers';
 import { bodyLimit } from 'hono/body-limit';
 
 import { securityMiddleware } from './middleware/security';
+import { bodyLimitForPath } from './middleware/bodyLimit';
 import { globalRateLimit } from './middleware/globalRateLimit';
 import { authRoutes } from './routes/auth';
 import { accountDeletionAdminRoutes } from './routes/auth/accountDeletion';
@@ -31,6 +32,13 @@ import { alertTemplateRoutes } from './routes/alertTemplates';
 import { ticketsRoutes } from './routes/tickets';
 import { catalogRoutes } from './routes/catalog';
 import { emailWebhookRoutes } from './routes/tickets/emailWebhook';
+import { invoiceRoutes } from './routes/invoices';
+import { quoteRoutes } from './routes/quotes';
+import { stripeConnectRoutes } from './routes/stripeConnect';
+import { stripeWebhookRoutes } from './routes/webhooks/stripe';
+import { invoiceAssemblyRoutes } from './routes/invoices/assembly';
+import { invoiceSettingsRoutes } from './routes/invoices/settings';
+import { contractRoutes } from './routes/contracts';
 import { timeEntriesRoutes } from './routes/timeEntries';
 import { ticketCategoriesRoutes } from './routes/ticketCategories';
 import { ticketConfigRoutes } from './routes/ticketConfig';
@@ -65,6 +73,7 @@ import { patchPolicyRoutes } from './routes/patchPolicies';
 import { updateRingRoutes } from './routes/updateRings';
 import { mobileRoutes } from './routes/mobile';
 import { approvalRoutes } from './routes/approvals';
+import { authenticatorRoutes, approverDevicesRoutes } from './routes/authenticator';
 import { lifecycleRoutes, lifecycleAdminRoutes } from './routes/lifecycle';
 import { mobileDeviceBlockedMiddleware } from './middleware/mobileDeviceBlocked';
 import { analyticsRoutes } from './routes/analytics';
@@ -72,6 +81,7 @@ import { discoveryRoutes } from './routes/discovery';
 import { networkBaselineRoutes } from './routes/networkBaselines';
 import { networkChangeRoutes } from './routes/networkChanges';
 import { portalRoutes } from './routes/portal';
+import { clientAiRoutes } from './routes/clientAi';
 import { pluginRoutes } from './routes/plugins';
 import { maintenanceRoutes } from './routes/maintenance';
 import { securityRoutes } from './routes/security';
@@ -126,6 +136,7 @@ import { googleRoutes } from './routes/google';
 import { m365Routes } from './routes/m365';
 import { drRoutes } from './routes/dr';
 import { adminRoutes } from './routes/admin';
+import { internalSyntheticRoutes } from './routes/internal/synthetic';
 import { bootstrapPlatformAdmins } from './services/platformAdminBootstrap';
 import { captureException, flushSentry, initSentry } from './services/sentry';
 import { partnerGuard } from './middleware/partnerGuard';
@@ -133,6 +144,8 @@ import { API_VERSION } from './version';
 
 // Workers
 import { initializeAlertWorkers, shutdownAlertWorkers } from './jobs/alertWorker';
+import { initializeInvoiceWorkers, shutdownInvoiceWorkers } from './jobs/invoiceWorker';
+import { initializeContractWorkers, shutdownContractWorkers } from './jobs/contractWorker';
 import { initializeOfflineDetector, shutdownOfflineDetector } from './jobs/offlineDetector';
 import { initializeNotificationDispatcher, shutdownNotificationDispatcher } from './services/notificationDispatcher';
 import { initializeEventLogRetention, shutdownEventLogRetention } from './jobs/eventLogRetention';
@@ -286,19 +299,8 @@ app.use('*', async (c, next) => {
   if (c.req.path === '/oauth' || c.req.path.startsWith('/oauth/')) {
     return next();
   }
-  // Dev-push uploads agent binaries (~20MB); skip the default 1MB limit.
-  if (c.req.path.startsWith('/api/v1/dev/push')) {
-    return bodyLimit({ maxSize: 150 * 1024 * 1024, onError: (ctx) => ctx.json({ error: 'Binary too large (max 150MB)' }, 413) })(c, next);
-  }
-  // File transfer chunk uploads can be up to 50MB; route-level bodyLimit handles the real cap.
-  if (c.req.path.match(/^\/api\/v1\/remote\/transfers\/[^/]+\/chunks$/)) {
-    return bodyLimit({ maxSize: 50 * 1024 * 1024, onError: (ctx) => ctx.json({ error: 'Chunk too large (max 50MB)' }, 413) })(c, next);
-  }
-  // File browser uploads send base64-encoded content in JSON body (~33% overhead).
-  if (c.req.path.match(/^\/api\/v1\/system-tools\/devices\/[^/]+\/files\/upload$/)) {
-    return bodyLimit({ maxSize: 50 * 1024 * 1024, onError: (ctx) => ctx.json({ error: 'File too large (max ~37MB)' }, 413) })(c, next);
-  }
-  return bodyLimit({ maxSize: 1024 * 1024, onError: (ctx) => ctx.json({ error: 'Request body too large' }, 413) })(c, next);
+  const { maxSize, error } = bodyLimitForPath(c.req.path);
+  return bodyLimit({ maxSize, onError: (ctx) => ctx.json({ error }, 413) })(c, next);
 });
 app.use('*', globalRateLimit());
 app.use('*', prettyJSON());
@@ -663,6 +665,7 @@ api.use('*', async (c, next) => {
   if (path.startsWith('/api/v1/users/me')) return next();
   if (path === '/api/v1/partner/me' || path.startsWith('/api/v1/partner/me/')) return next();
   if (path.startsWith('/api/v1/agents/')) return next();
+  if (path.startsWith('/api/v1/internal/synthetic/')) return next();   // synthetic test router — self-gated (token + canary latch)
   return partnerGuard(c, next);
 });
 
@@ -735,6 +738,18 @@ api.route('/alerts', alertRoutes);
 api.route('/alert-templates', alertTemplateRoutes);
 api.route('/tickets', ticketsRoutes);
 api.route('/catalog', catalogRoutes);
+api.route('/invoices', invoiceRoutes);
+api.route('/quotes', quoteRoutes);
+api.route('/partner/stripe-connect', stripeConnectRoutes);
+api.route('/contracts', contractRoutes);
+// Assembly routes nest under the existing /orgs and /tickets namespaces, so they
+// mount at the api root: /api/v1/orgs/:orgId/invoices/assemble and
+// /api/v1/tickets/:ticketId/invoice. invoiceAssemblyRoutes applies authMiddleware itself.
+api.route('/', invoiceAssemblyRoutes);
+// Billing settings nest under /partner and /orgs at the api root:
+// /api/v1/partner/billing-settings and /api/v1/orgs/:orgId/billing-settings.
+// invoiceSettingsRoutes applies authMiddleware itself.
+api.route('/', invoiceSettingsRoutes);
 api.route('/time-entries', timeEntriesRoutes);
 api.route('/ticket-categories', ticketCategoriesRoutes);
 api.route('/ticket-config', ticketConfigRoutes);
@@ -767,6 +782,10 @@ api.route('/webhooks', webhookRoutes);
 // Inbound email webhook — no session auth, HMAC-gated. partnerGuard passes
 // through for requests with no Authorization header (calls next() immediately).
 api.route('/webhooks/tickets', emailWebhookRoutes);
+// Stripe Connect webhook — no session auth, signature-verified. partnerGuard
+// passes through (no Authorization header); the route reads the raw body itself
+// via c.req.text(), so no body-consuming middleware sits in front of it.
+api.route('/webhooks', stripeWebhookRoutes);
 api.route('/policies', policyRoutes);
 api.route('/configuration-policies', configPolicyRoutes);
 api.route('/psa', psaRoutes);
@@ -782,6 +801,8 @@ api.route('/update-rings', updateRingRoutes);
 api.use('/mobile/*', mobileDeviceBlockedMiddleware);
 api.route('/mobile', mobileRoutes);
 api.route('/mobile/approvals', approvalRoutes);
+api.route('/authenticator', authenticatorRoutes);
+api.route('/me/approver-devices', approverDevicesRoutes);
 api.route('/', lifecycleRoutes);
 api.route('/', lifecycleAdminRoutes);
 api.route('/analytics', analyticsRoutes);
@@ -789,6 +810,7 @@ api.route('/discovery', discoveryRoutes);
 api.route('/network/baselines', networkBaselineRoutes);
 api.route('/network/changes', networkChangeRoutes);
 api.route('/portal', portalRoutes);
+api.route('/client-ai', clientAiRoutes);
 api.route('/plugins', pluginRoutes);
 api.route('/maintenance', maintenanceRoutes);
 api.route('/security', securityRoutes);
@@ -808,6 +830,7 @@ api.route('/groups', groupRoutes);
 api.route('/device-groups', groupRoutes);
 api.route('/integrations', integrationRoutes);
 api.route('/partner', partnerRoutes);
+api.route('/internal/synthetic', internalSyntheticRoutes);
 api.route('/partner/known-guests', networkKnownGuestsRoutes);
 api.route('/tags', tagRoutes);
 api.route('/custom-fields', customFieldRoutes);
@@ -1084,6 +1107,8 @@ async function initializeWorkers(): Promise<void> {
     ['ticketNotifyWorker', initializeTicketNotifyWorker],
     ['ticketSlaWorker', initializeTicketSlaWorker],
     ['inboundEmailWorker', initializeInboundEmailWorker],
+    ['invoiceWorker', initializeInvoiceWorkers],
+    ['contractWorker', initializeContractWorkers],
   ];
 
   await Promise.allSettled(
@@ -1242,6 +1267,8 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
     shutdownTicketNotifyWorker,
     shutdownTicketSlaWorker,
     shutdownInboundEmailWorker,
+    shutdownInvoiceWorkers,
+    shutdownContractWorkers,
     shutdownEventDispatcher,
     async () => getEventBus().close(),
     closeRedis,
