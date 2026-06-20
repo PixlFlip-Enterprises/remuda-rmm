@@ -56,6 +56,19 @@ export const OAUTH_JWKS_PRIVATE_JWK = process.env.OAUTH_JWKS_PRIVATE_JWK ?? '';
 export const OAUTH_JWKS_PUBLIC_JWK = process.env.OAUTH_JWKS_PUBLIC_JWK ?? '';
 export const OAUTH_COOKIE_SECRET = process.env.OAUTH_COOKIE_SECRET ?? '';
 
+// PixlFlip as an upstream OpenID Connect identity provider (federated login).
+// The flow is gated on PIXLFLIP_SSO_ENABLED AND a complete config; when any of
+// issuer/clientId/clientSecret is missing the routes fail closed (404/500), so
+// a half-configured deploy never starts a flow it cannot finish.
+export const PIXLFLIP_SSO_ENABLED = envFlag('PIXLFLIP_SSO_ENABLED', false);
+export const PIXLFLIP_SSO_ISSUER = (process.env.PIXLFLIP_SSO_ISSUER ?? '').trim();
+export const PIXLFLIP_SSO_CLIENT_ID = (process.env.PIXLFLIP_SSO_CLIENT_ID ?? '').trim();
+export const PIXLFLIP_SSO_CLIENT_SECRET = (process.env.PIXLFLIP_SSO_CLIENT_SECRET ?? '').trim();
+// Org role assigned to JIT-provisioned PixlFlip users when the breeze_role
+// claim doesn't match an existing org role by name. Must be a seeded
+// organization-scope role name (e.g. 'Org Admin', 'Org Technician').
+export const PIXLFLIP_SSO_DEFAULT_ORG_ROLE = (process.env.PIXLFLIP_SSO_DEFAULT_ORG_ROLE ?? 'Org Technician').trim();
+
 // Kill-switch for the role-level MFA gate (Task 8 of the launch-readiness
 // sprint). Defaults ON so the secure-by-default posture holds; ops can
 // flip it OFF without a code change to relieve an enrollment outage that
