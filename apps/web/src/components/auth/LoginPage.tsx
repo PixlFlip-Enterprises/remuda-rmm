@@ -57,6 +57,23 @@ async function checkCfAccessLoginEnabled(): Promise<boolean> {
   }
 }
 
+async function checkPixlflipSsoEnabled(): Promise<boolean> {
+  try {
+    const apiHost = import.meta.env.PUBLIC_API_URL || '';
+    const res = await fetch(`${apiHost}/api/v1/config`, {
+      method: 'GET',
+      credentials: 'include',
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) return false;
+    const body = (await res.json()) as { pixlflipSso?: { enabled?: boolean } };
+    return !!body.pixlflipSso?.enabled;
+  } catch (err) {
+    console.warn('[login] PixlFlip SSO config check failed; hiding the button', err);
+    return false;
+  }
+}
+
 interface LoginPageProps {
   next?: string;
 }
@@ -80,8 +97,24 @@ export default function LoginPage({ next }: LoginPageProps = {}) {
   // entirely in the effect (client-only), keeping SSR and CSR initial output
   // identical (both render the placeholder).
   const [cfAccessRedirectChecked, setCfAccessRedirectChecked] = useState(false);
+  const [pixlflipSsoEnabled, setPixlflipSsoEnabled] = useState(false);
 
   const login = useAuthStore((state) => state.login);
+
+  // Surface "Sign in with PixlFlip" only when the deployment has it configured.
+  useEffect(() => {
+    let cancelled = false;
+    void checkPixlflipSsoEnabled().then((enabled) => {
+      if (!cancelled) setPixlflipSsoEnabled(enabled);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handlePixlflipLogin = () => {
+    const redirectParam =
+      safeNext && safeNext !== '/' ? `?redirect=${encodeURIComponent(safeNext)}` : '';
+    window.location.assign(`/api/v1/sso/pixlflip/login${redirectParam}`);
+  };
 
   // CF Access trust mode: if the deployment has it on AND we're not already
   // in the post-redirect bounce (which AuthOverlay handles), top-level
@@ -254,6 +287,26 @@ export default function LoginPage({ next }: LoginPageProps = {}) {
         errorMessage={error}
         loading={loading}
       />
+      {pixlflipSsoEnabled && (
+        <div className="mt-6">
+          <div className="relative mb-4">
+            <div className="absolute inset-0 flex items-center">
+              <span className="w-full border-t border-border" />
+            </div>
+            <div className="relative flex justify-center text-xs uppercase">
+              <span className="bg-background px-2 text-muted-foreground">or</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            data-testid="pixlflip-sso-button"
+            onClick={handlePixlflipLogin}
+            className="flex w-full items-center justify-center gap-2 rounded-md border border-border bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-muted"
+          >
+            Sign in with PixlFlip
+          </button>
+        </div>
+      )}
       <McpUrlCard variant="compact" requireOAuth className="mt-8" />
     </div>
   );
