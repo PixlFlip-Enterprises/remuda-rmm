@@ -61,6 +61,7 @@ import { apiKeyRoutes } from './routes/apiKeys';
 import { enrollmentKeyRoutes, publicEnrollmentRoutes, publicShortLinkRoutes } from './routes/enrollmentKeys';
 import { installerRoutes } from './routes/installer';
 import { ssoRoutes } from './routes/sso';
+import { pixlflipSsoRoutes } from './routes/auth/pixlflipSso';
 import { docsRoutes } from './routes/docs';
 import { accessReviewRoutes } from './routes/accessReviews';
 import { webhookRoutes } from './routes/webhooks';
@@ -776,6 +777,9 @@ api.route('/enrollment-keys', publicEnrollmentRoutes); // Public download (no au
 api.route('/enrollment-keys', enrollmentKeyRoutes);
 api.route('/installer', installerRoutes);
 api.route('/sso', ssoRoutes);
+// PixlFlip federated login (global env-configured OIDC consumer). Mounted under
+// /sso/pixlflip; distinct paths from the per-org ssoRoutes above.
+api.route('/sso/pixlflip', pixlflipSsoRoutes);
 api.route('/docs', docsRoutes);
 api.route('/access-reviews', accessReviewRoutes);
 api.route('/webhooks', webhookRoutes);
