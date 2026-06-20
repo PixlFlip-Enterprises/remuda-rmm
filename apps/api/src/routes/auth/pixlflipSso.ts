@@ -32,6 +32,7 @@ import {
   bindRefreshJtiToFamily
 } from '../../services';
 import { getTrustedClientIp } from '../../services/clientIp';
+import { createAuditLogAsync } from '../../services/auditService';
 import { createSsoTokenExchangeGrant } from '../sso';
 import { getCookieValue } from './helpers';
 import {
@@ -41,7 +42,8 @@ import {
   PIXLFLIP_SSO_CLIENT_SECRET,
   PIXLFLIP_SSO_DEFAULT_ORG_ROLE,
   PIXLFLIP_SSO_DEFAULT_PARTNER_ROLE,
-  PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE
+  PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE,
+  PIXLFLIP_SSO_SYSTEM_PARTNER_ID
 } from '../../config/env';
 
 export const pixlflipSsoRoutes = new Hono();
@@ -73,6 +75,7 @@ interface PixlflipSsoConfig {
   defaultOrgRole: string;
   defaultPartnerRole: string;
   allowSystemScope: boolean;
+  systemPartnerId: string;
 }
 
 /**
@@ -91,7 +94,8 @@ export function getPixlflipSsoConfig(): PixlflipSsoConfig | null {
     clientSecret: PIXLFLIP_SSO_CLIENT_SECRET,
     defaultOrgRole: PIXLFLIP_SSO_DEFAULT_ORG_ROLE || 'Org Technician',
     defaultPartnerRole: PIXLFLIP_SSO_DEFAULT_PARTNER_ROLE || 'Partner Technician',
-    allowSystemScope: PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE
+    allowSystemScope: PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE,
+    systemPartnerId: PIXLFLIP_SSO_SYSTEM_PARTNER_ID
   };
 }
 
@@ -101,6 +105,23 @@ export interface BreezeClaims {
   orgId?: string;
   partnerId?: string;
   role?: string;
+}
+
+// OIDC `amr` values that indicate a second factor was used. When PixlFlip
+// asserts one of these, the minted Breeze token is marked mfa-satisfied so a
+// force_mfa role doesn't re-challenge a user the IdP already stepped up.
+const MFA_AMR_VALUES = new Set(['mfa', 'otp', 'totp', 'hwk', 'sms', 'swk', 'phr', 'phrh']);
+
+/**
+ * Whether the IdP asserts MFA was performed, from the id_token `amr` claim
+ * (array of auth-method references). Absent/unrecognised ⇒ false, so this only
+ * ever *grants* mfa-satisfied when the IdP positively says so — no regression
+ * for IdPs that don't emit `amr`.
+ */
+export function mfaSatisfiedFromClaims(claims: IDTokenClaims | Record<string, unknown>): boolean {
+  const amr = claims['amr'];
+  if (!Array.isArray(amr)) return false;
+  return amr.some((v) => typeof v === 'string' && MFA_AMR_VALUES.has(v.toLowerCase()));
 }
 
 export function extractBreezeClaims(claims: IDTokenClaims | Record<string, unknown>): BreezeClaims {
@@ -230,7 +251,7 @@ async function resolvePartnerRoleId(
 async function findOrCreateSsoUser(
   email: string,
   name: string | undefined,
-  defaults: { partnerId: string | null; orgId: string | null }
+  defaults: { partnerId: string; orgId: string | null }
 ): Promise<typeof users.$inferSelect | null> {
   const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
   if (existing) return existing;
@@ -523,12 +544,41 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
         // Platform admin is the most privileged grant in Breeze; federating it
         // is opt-in only (PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE).
         if (!cfg.allowSystemScope) return { error: 'sso_scope_unsupported' };
-        const user = await findOrCreateSsoUser(email, attrs.name, { partnerId: null, orgId: null });
+
+        // Every user row needs a partner (users.partner_id is NOT NULL), even a
+        // platform admin. Home them to the claimed partner, else the configured
+        // system partner. (Existing users keep their current partner — this only
+        // matters for the JIT-create path.)
+        const [existing] = await db
+          .select({ id: users.id })
+          .from(users)
+          .where(eq(users.email, email))
+          .limit(1);
+
+        const homePartnerId = breeze.partnerId || cfg.systemPartnerId;
+        if (!existing && !homePartnerId) return { error: 'sso_missing_system_partner' };
+        if (!existing) {
+          const [partner] = await db
+            .select({ id: partners.id, status: partners.status })
+            .from(partners)
+            .where(eq(partners.id, homePartnerId))
+            .limit(1);
+          if (!partner) return { error: 'sso_unknown_partner' };
+          if (partner.status !== 'active') return { error: 'sso_partner_inactive' };
+        }
+
+        const user = await findOrCreateSsoUser(email, attrs.name, {
+          // homePartnerId is only consumed on the create path (validated above);
+          // for an existing user it's ignored.
+          partnerId: homePartnerId,
+          orgId: null
+        });
         if (!user) return { error: 'sso_user_creation_failed' };
         if (!user.isPlatformAdmin) {
           await db.update(users).set({ isPlatformAdmin: true }).where(eq(users.id, user.id));
         }
         await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+        // System tokens carry no tenant (scope=system), matching password login.
         return { user, scope: 'system', orgId: null, partnerId: null, roleId: null };
       }
 
@@ -537,8 +587,25 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
 
     if ('error' in provisioned) {
       clearCookie();
+      // Audit denied federated logins so a misconfigured tenant/role mapping or
+      // a rejected scope is visible, not just silent on the login screen.
+      void createAuditLogAsync({
+        actorType: 'system',
+        actorId: 'pixlflip-sso',
+        actorEmail: email,
+        action: 'user.login',
+        resourceType: 'user',
+        details: { method: 'pixlflip-sso', scope: breeze.scope, reason: provisioned.error },
+        ipAddress: getTrustedClientIp(c),
+        userAgent: c.req.header('user-agent'),
+        result: 'denied',
+        errorMessage: provisioned.error
+      });
       return c.redirect(`/login?error=${provisioned.error}`);
     }
+
+    // Honor an IdP-asserted second factor so force_mfa roles aren't re-challenged.
+    const mfaSatisfied = mfaSatisfiedFromClaims(claims);
 
     // Mint a token bound to the provisioned scope (same payload shape +
     // refresh-family reuse-detection as password login).
@@ -549,7 +616,7 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
       orgId: provisioned.orgId,
       partnerId: provisioned.partnerId,
       scope: provisioned.scope,
-      mfa: false
+      mfa: mfaSatisfied
     };
 
     const familyId = await mintRefreshTokenFamily(provisioned.user.id);
@@ -563,6 +630,20 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
       userId: provisioned.user.id,
       ipAddress: getTrustedClientIp(c),
       userAgent: c.req.header('user-agent') || 'unknown'
+    });
+
+    void createAuditLogAsync({
+      orgId: provisioned.orgId ?? undefined,
+      actorId: provisioned.user.id,
+      actorEmail: provisioned.user.email,
+      action: 'user.login',
+      resourceType: 'user',
+      resourceId: provisioned.user.id,
+      resourceName: provisioned.user.name ?? undefined,
+      details: { method: 'pixlflip-sso', scope: provisioned.scope, mfa: mfaSatisfied },
+      ipAddress: getTrustedClientIp(c),
+      userAgent: c.req.header('user-agent'),
+      result: 'success'
     });
 
     const tokenExchangeCode = createSsoTokenExchangeGrant(accessToken, refreshToken, expiresInSeconds);

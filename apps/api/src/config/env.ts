@@ -93,6 +93,11 @@ export const PIXLFLIP_SSO_DEFAULT_PARTNER_ROLE = (process.env.PIXLFLIP_SSO_DEFAU
 // most privileged grant in Breeze, so federating it is OFF unless an operator
 // explicitly opts in. When false, a breeze_scope=system claim is rejected.
 export const PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE = envFlag('PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE', false);
+// Every Breeze user row requires a partner (users.partner_id is NOT NULL), even
+// platform admins. System-scope SSO users are homed to this partner unless the
+// claim carries breeze_partner_id. Required (with the flag on) to provision a
+// brand-new system user; ignored for users that already exist.
+export const PIXLFLIP_SSO_SYSTEM_PARTNER_ID = (process.env.PIXLFLIP_SSO_SYSTEM_PARTNER_ID ?? '').trim();
 
 // Kill-switch for the role-level MFA gate (Task 8 of the launch-readiness
 // sprint). Defaults ON so the secure-by-default posture holds; ops can
