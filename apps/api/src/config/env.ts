@@ -68,6 +68,14 @@ export const PIXLFLIP_SSO_CLIENT_SECRET = (process.env.PIXLFLIP_SSO_CLIENT_SECRE
 // claim doesn't match an existing org role by name. Must be a seeded
 // organization-scope role name (e.g. 'Org Admin', 'Org Technician').
 export const PIXLFLIP_SSO_DEFAULT_ORG_ROLE = (process.env.PIXLFLIP_SSO_DEFAULT_ORG_ROLE ?? 'Org Technician').trim();
+// Partner role assigned to JIT-provisioned partner-scope users when the
+// breeze_role claim doesn't match an existing partner role by name. Must be a
+// seeded partner-scope role name (e.g. 'Partner Admin', 'Partner Technician').
+export const PIXLFLIP_SSO_DEFAULT_PARTNER_ROLE = (process.env.PIXLFLIP_SSO_DEFAULT_PARTNER_ROLE ?? 'Partner Technician').trim();
+// System scope grants platform-admin (users.is_platform_admin). That is the
+// most privileged grant in Breeze, so federating it is OFF unless an operator
+// explicitly opts in. When false, a breeze_scope=system claim is rejected.
+export const PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE = envFlag('PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE', false);
 
 // Kill-switch for the role-level MFA gate (Task 8 of the launch-readiness
 // sprint). Defaults ON so the secure-by-default posture holds; ops can
