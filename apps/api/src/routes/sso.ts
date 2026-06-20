@@ -205,7 +205,7 @@ function sweepSsoTokenExchangeGrants(nowMs: number = Date.now()) {
   capMapByOldest(ssoTokenExchangeGrants, SSO_TOKEN_GRANT_CAP, (grant) => grant.createdAtMs);
 }
 
-function createSsoTokenExchangeGrant(
+export function createSsoTokenExchangeGrant(
   accessToken: string,
   refreshToken: string,
   expiresInSeconds: number

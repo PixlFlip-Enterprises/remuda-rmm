@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, uniqueIndex } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, index, uniqueIndex } from 'drizzle-orm/pg-core';
 import { organizations } from './orgs';
 import { users } from './users';
 
@@ -110,4 +110,22 @@ export const ssoVerifiedDomains = pgTable('sso_verified_domains', {
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (t) => ({
   orgDomainUnique: uniqueIndex('sso_verified_domains_org_domain_idx').on(t.orgId, t.domain),
+}));
+
+// PixlFlip global SSO login sessions. Like `ssoSessions` but without a
+// `providerId` FK — the PixlFlip identity provider is configured globally via
+// env, not as a per-org `sso_providers` row. Single-use, TTL-bounded transient
+// OIDC flow state; no tenant columns, no RLS (see the migration for rationale).
+export const pixlflipSsoSessions = pgTable('pixlflip_sso_sessions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+
+  state: varchar('state', { length: 64 }).notNull().unique(),
+  nonce: varchar('nonce', { length: 64 }).notNull(),
+  codeVerifier: varchar('code_verifier', { length: 128 }), // for PKCE
+  redirectUrl: varchar('redirect_url', { length: 500 }),
+
+  expiresAt: timestamp('expires_at').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+}, (t) => ({
+  expiresAtIdx: index('pixlflip_sso_sessions_expires_at_idx').on(t.expiresAt)
 }));
