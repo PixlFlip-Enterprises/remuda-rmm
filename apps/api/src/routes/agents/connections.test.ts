@@ -328,6 +328,63 @@ describe('connections routes', () => {
       const body = await res.json();
       expect(body.count).toBe(4);
     });
+
+    it('chunks large inserts to stay under the Postgres 65534-param limit (#1696)', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: DEVICE_ID, agentId: AGENT_ID, orgId: 'org-1' }]),
+          }),
+        }),
+      } as any);
+
+      const insertedBatches: any[][] = [];
+      vi.mocked(db.transaction).mockImplementation(async (fn: any) => {
+        const tx = {
+          delete: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue(undefined),
+          }),
+          insert: vi.fn().mockReturnValue({
+            values: vi.fn().mockImplementation((rows: any[]) => {
+              insertedBatches.push(rows);
+              return Promise.resolve(undefined);
+            }),
+          }),
+        };
+        return fn(tx);
+      });
+
+      // 11 columns/row × 10,000 rows = 110,000 bind params — far over the
+      // 65534 limit if sent as one statement. The schema cap is 10,000.
+      const COUNT = 10000;
+      const connections = Array.from({ length: COUNT }, (_, i) => ({
+        protocol: 'tcp',
+        localAddr: '0.0.0.0',
+        localPort: (i % 65535),
+      }));
+
+      const res = await app.request(`/agents/${AGENT_ID}/connections`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connections }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.count).toBe(COUNT);
+
+      // Must have split into multiple batches (old code inserted in one shot).
+      expect(insertedBatches.length).toBeGreaterThan(1);
+      // No batch may exceed the chunk size (5000 rows × 11 cols = 55k params).
+      for (const batch of insertedBatches) {
+        expect(batch.length).toBeLessThanOrEqual(5000);
+      }
+      // Concatenated batches must equal the original rows IN ORDER — guards
+      // against a chunk() off-by-one that drops/duplicates a specific row while
+      // keeping the total count correct (localPort is the unique per-row marker).
+      const flatPorts = insertedBatches.flat().map((r: { localPort: number }) => r.localPort);
+      expect(flatPorts).toEqual(connections.map((c) => c.localPort));
+    });
   });
 
   // ----------------------------------------------------------------
