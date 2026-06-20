@@ -460,6 +460,67 @@ export class AuthSessionExpiredError extends Error {
   }
 }
 
+/**
+ * Bootstraps the auth store after a "Sign in with PixlFlip" redirect.
+ *
+ * The API's /sso/pixlflip/callback mints a session and redirects back with a
+ * one-time `#ssoCode` in the URL hash (and sets the HttpOnly refresh cookie).
+ * This helper completes the handshake:
+ *
+ *   1. Trade the code for an access token (`POST /sso/exchange`)
+ *   2. Fetch the user record (`/users/me`) with that token
+ *   3. Populate the store via `login(user, tokens)`
+ *
+ * Returns true if the store was populated; false if any step failed (the caller
+ * should fall back to the regular login form).
+ */
+export async function bootstrapFromPixlflipSsoCode(code: string): Promise<boolean> {
+  let exchangeResponse: Response;
+  try {
+    exchangeResponse = await fetch(buildApiUrl('/sso/exchange'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ code }),
+    });
+  } catch {
+    return false;
+  }
+  if (!exchangeResponse.ok) return false;
+
+  const data = (await exchangeResponse.json()) as {
+    accessToken?: string;
+    expiresInSeconds?: number;
+  };
+  if (!data.accessToken) return false;
+  const tokens: Tokens = {
+    accessToken: data.accessToken,
+    expiresInSeconds: data.expiresInSeconds ?? 900,
+  };
+
+  let meResponse: Response;
+  try {
+    meResponse = await fetch(buildApiUrl('/users/me'), {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${tokens.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      credentials: 'include',
+    });
+  } catch {
+    return false;
+  }
+  if (!meResponse.ok) return false;
+
+  const user = (await meResponse.json()) as User | null;
+  if (!user || !user.id) return false;
+
+  useAuthStore.getState().login(user, tokens);
+  await fetchAndApplyPreferences();
+  return true;
+}
+
 export async function fetchWithAuth(rawUrl: string, options: RequestInit = {}): Promise<Response> {
   // Auto-inject orgId from the org store so partner/system users always scope API calls
   let url = rawUrl;

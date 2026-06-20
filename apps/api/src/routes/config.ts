@@ -1,7 +1,13 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
-import { cfAccessTrustEnabled } from '../config/env';
+import {
+  cfAccessTrustEnabled,
+  PIXLFLIP_SSO_ENABLED,
+  PIXLFLIP_SSO_ISSUER,
+  PIXLFLIP_SSO_CLIENT_ID,
+  PIXLFLIP_SSO_CLIENT_SECRET,
+} from '../config/env';
 import { envFlag } from '../utils/envFlag';
 import { authMiddleware, requireScope, type AuthContext } from '../middleware/auth';
 import { resolveAllMlFeatureFlagsForOrg } from '../services/mlFeatureFlags';
@@ -24,6 +30,16 @@ configRoutes.get('/', (c) => {
     },
     cfAccessLogin: {
       enabled: cfAccessTrustEnabled(),
+    },
+    // Whether "Sign in with PixlFlip" should be offered. Mirrors the fail-closed
+    // gating in routes/auth/pixlflipSso.ts: enabled only when the feature flag
+    // is on AND the provider is fully configured.
+    pixlflipSso: {
+      enabled:
+        PIXLFLIP_SSO_ENABLED &&
+        !!PIXLFLIP_SSO_ISSUER &&
+        !!PIXLFLIP_SSO_CLIENT_ID &&
+        !!PIXLFLIP_SSO_CLIENT_SECRET,
     },
     // Runtime source of truth for whether self-service MSP registration is
     // open. The web bundle can't read PUBLIC_ENABLE_REGISTRATION at runtime

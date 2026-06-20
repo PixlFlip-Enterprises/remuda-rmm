@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react';
-import { bootstrapFromCfAccessRedirect, restoreAccessTokenFromCookie, useAuthStore } from '../../stores/auth';
+import {
+  bootstrapFromCfAccessRedirect,
+  bootstrapFromPixlflipSsoCode,
+  restoreAccessTokenFromCookie,
+  useAuthStore,
+} from '../../stores/auth';
 import { Loader2 } from 'lucide-react';
 import { navigateTo } from '../../lib/navigation';
 
@@ -19,12 +24,34 @@ function consumeCfAccessLoginParam(): boolean {
   return true;
 }
 
+// The PixlFlip SSO callback redirects back with a one-time `#ssoCode=<code>` in
+// the URL hash. Read it and strip it from the URL (so a refresh / share can't
+// replay it) before exchanging it for a session.
+function consumePixlflipSsoCode(): string | null {
+  if (typeof window === 'undefined') return null;
+  const hash = window.location.hash.startsWith('#')
+    ? window.location.hash.slice(1)
+    : window.location.hash;
+  const params = new URLSearchParams(hash);
+  const code = params.get('ssoCode');
+  if (!code) return null;
+  params.delete('ssoCode');
+  const cleanHash = params.toString();
+  const cleanUrl =
+    window.location.pathname +
+    window.location.search +
+    (cleanHash ? `#${cleanHash}` : '');
+  window.history.replaceState({}, '', cleanUrl);
+  return code;
+}
+
 export default function AuthOverlay() {
   const { isAuthenticated, isLoading, tokens } = useAuthStore();
   const [isChecking, setIsChecking] = useState(true);
   const [isRecovering, setIsRecovering] = useState(false);
   const [recoverAttempted, setRecoverAttempted] = useState(false);
   const [cfBootstrapAttempted, setCfBootstrapAttempted] = useState(false);
+  const [ssoBootstrapAttempted, setSsoBootstrapAttempted] = useState(false);
   const [fadeState, setFadeState] = useState<'visible' | 'fading' | 'hidden'>('visible');
 
   useEffect(() => {
@@ -57,6 +84,25 @@ export default function AuthOverlay() {
     // Fast path: tokens were rehydrated from localStorage — no network needed
     if (isAuthenticated && tokens?.accessToken) {
       return;
+    }
+
+    // PixlFlip SSO redirect bootstrap: the callback redirects here with a
+    // one-time `#ssoCode`. Exchange it for a session before falling through to
+    // the "no session, redirect to /login" path. Runs once per overlay mount.
+    if (!isAuthenticated && !ssoBootstrapAttempted) {
+      const ssoCode = consumePixlflipSsoCode();
+      if (ssoCode) {
+        setSsoBootstrapAttempted(true);
+        setIsRecovering(true);
+        void bootstrapFromPixlflipSsoCode(ssoCode).then((ok) => {
+          if (cancelled) return;
+          setIsRecovering(false);
+          if (!ok) {
+            void navigateTo('/login?error=sso', { replace: true });
+          }
+        });
+        return () => { cancelled = true; };
+      }
     }
 
     // CF Access redirect bootstrap: the server's GET /api/v1/auth/cf-access-login
@@ -106,7 +152,7 @@ export default function AuthOverlay() {
     }
 
     return () => { cancelled = true; };
-  }, [isAuthenticated, isLoading, isChecking, tokens, recoverAttempted, isRecovering, cfBootstrapAttempted]);
+  }, [isAuthenticated, isLoading, isChecking, tokens, recoverAttempted, isRecovering, cfBootstrapAttempted, ssoBootstrapAttempted]);
 
   // Authenticated with token — fade out then unmount
   const shouldHide = !isChecking && !isLoading && isAuthenticated && !!tokens?.accessToken;

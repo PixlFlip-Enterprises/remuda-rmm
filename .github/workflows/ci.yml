@@ -1209,6 +1209,15 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # Forks typically have Issues disabled, where the tracking-issue
+          # automation below cannot run. Detect that and no-op cleanly rather
+          # than failing the whole CI run (the gh issue calls would otherwise
+          # error under `set -e`).
+          issues_enabled=$(gh repo view "$GITHUB_REPOSITORY" --json hasIssuesEnabled --jq '.hasIssuesEnabled' 2>/dev/null || echo "false")
+          if [ "$issues_enabled" != "true" ]; then
+            echo "Issues are disabled on $GITHUB_REPOSITORY — skipping ci-red tracking issue management."
+            exit 0
+          fi
           gh label create ci-red --repo "$GITHUB_REPOSITORY" \
             --color B60205 --description "CI is failing on main" 2>/dev/null || true
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label ci-red --state open \
