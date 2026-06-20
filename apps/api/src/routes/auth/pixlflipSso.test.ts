@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   extractBreezeClaims,
   getPixlflipSsoConfig,
+  mfaSatisfiedFromClaims,
   pixlflipSsoRoutes
 } from './pixlflipSso';
 
@@ -39,6 +40,22 @@ describe('pixlflipSso: extractBreezeClaims', () => {
         breeze_org_id: 123 as unknown as string
       })
     ).toEqual({ scope: undefined, orgId: undefined, partnerId: undefined, role: undefined });
+  });
+});
+
+describe('pixlflipSso: mfaSatisfiedFromClaims', () => {
+  const base = { sub: 'u1', iss: 'x', aud: 'y', exp: 0, iat: 0 };
+
+  it('returns true when amr asserts a second factor', () => {
+    expect(mfaSatisfiedFromClaims({ ...base, amr: ['pwd', 'mfa'] })).toBe(true);
+    expect(mfaSatisfiedFromClaims({ ...base, amr: ['otp'] })).toBe(true);
+    expect(mfaSatisfiedFromClaims({ ...base, amr: ['OTP'] })).toBe(true); // case-insensitive
+  });
+
+  it('returns false when amr has only single-factor or is absent/malformed', () => {
+    expect(mfaSatisfiedFromClaims({ ...base, amr: ['pwd'] })).toBe(false);
+    expect(mfaSatisfiedFromClaims({ ...base })).toBe(false);
+    expect(mfaSatisfiedFromClaims({ ...base, amr: 'mfa' as unknown as string[] })).toBe(false);
   });
 });
 
