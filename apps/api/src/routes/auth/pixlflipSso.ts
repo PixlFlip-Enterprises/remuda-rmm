@@ -7,6 +7,8 @@ import {
   users,
   organizations,
   organizationUsers,
+  partners,
+  partnerUsers,
   roles
 } from '../../db/schema';
 import {
@@ -37,7 +39,9 @@ import {
   PIXLFLIP_SSO_ISSUER,
   PIXLFLIP_SSO_CLIENT_ID,
   PIXLFLIP_SSO_CLIENT_SECRET,
-  PIXLFLIP_SSO_DEFAULT_ORG_ROLE
+  PIXLFLIP_SSO_DEFAULT_ORG_ROLE,
+  PIXLFLIP_SSO_DEFAULT_PARTNER_ROLE,
+  PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE
 } from '../../config/env';
 
 export const pixlflipSsoRoutes = new Hono();
@@ -67,6 +71,8 @@ interface PixlflipSsoConfig {
   clientId: string;
   clientSecret: string;
   defaultOrgRole: string;
+  defaultPartnerRole: string;
+  allowSystemScope: boolean;
 }
 
 /**
@@ -83,7 +89,9 @@ export function getPixlflipSsoConfig(): PixlflipSsoConfig | null {
     issuer: PIXLFLIP_SSO_ISSUER,
     clientId: PIXLFLIP_SSO_CLIENT_ID,
     clientSecret: PIXLFLIP_SSO_CLIENT_SECRET,
-    defaultOrgRole: PIXLFLIP_SSO_DEFAULT_ORG_ROLE || 'Org Technician'
+    defaultOrgRole: PIXLFLIP_SSO_DEFAULT_ORG_ROLE || 'Org Technician',
+    defaultPartnerRole: PIXLFLIP_SSO_DEFAULT_PARTNER_ROLE || 'Partner Technician',
+    allowSystemScope: PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE
   };
 }
 
@@ -188,6 +196,56 @@ async function resolveOrgRoleId(
     if (role) return role.id;
   }
   return null;
+}
+
+/**
+ * Resolve a partner-scope role id within `partnerId`, preferring the Breeze
+ * role name from the claim, then the configured default. Case-insensitive.
+ * Partner roles are seeded per-partner (scope='partner', partner_id set).
+ */
+async function resolvePartnerRoleId(
+  partnerId: string,
+  breezeRole: string | undefined,
+  defaultRole: string
+): Promise<string | null> {
+  const candidates = [breezeRole, defaultRole].filter((n): n is string => !!n && n.length > 0);
+  for (const name of candidates) {
+    const [role] = await db
+      .select({ id: roles.id })
+      .from(roles)
+      .where(and(eq(roles.partnerId, partnerId), eq(roles.scope, 'partner'), ilike(roles.name, name)))
+      .limit(1);
+    if (role) return role.id;
+  }
+  return null;
+}
+
+/**
+ * Find an existing user by (lowercased) email or JIT-create a federated one.
+ * Must be called inside a system DB-access context. `defaults` seed the home
+ * tenant on the users row; the composite (org_id, partner_id) FK is satisfied
+ * because org-scope passes the org's own partner, and partner/system scopes
+ * leave org_id null (a partial-null composite FK is not enforced).
+ */
+async function findOrCreateSsoUser(
+  email: string,
+  name: string | undefined,
+  defaults: { partnerId: string | null; orgId: string | null }
+): Promise<typeof users.$inferSelect | null> {
+  const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
+  if (existing) return existing;
+  const [created] = await db
+    .insert(users)
+    .values({
+      partnerId: defaults.partnerId,
+      orgId: defaults.orgId,
+      email,
+      name,
+      status: 'active',
+      passwordHash: null // federated users have no local password
+    })
+    .returning();
+  return created ?? null;
 }
 
 // ============================================
@@ -338,19 +396,11 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
 
     const breeze = extractBreezeClaims(claims);
 
-    // PR #4 handles org scope only. Other scopes (and "no mapping") are punted
-    // to PR #5; surface a clear reason rather than silently mis-provisioning.
+    // Every federated user must carry a breeze_scope claim (PR #3) so we know
+    // which tenancy axis to provision. No claim ⇒ unmapped identity.
     if (!breeze.scope) {
       clearCookie();
       return c.redirect('/login?error=sso_no_breeze_identity');
-    }
-    if (breeze.scope !== 'organization') {
-      clearCookie();
-      return c.redirect('/login?error=sso_scope_unsupported');
-    }
-    if (!breeze.orgId) {
-      clearCookie();
-      return c.redirect('/login?error=sso_missing_org');
     }
 
     // Identity (email/name) from the server-to-server userinfo call.
@@ -360,69 +410,129 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
       clearCookie();
       return c.redirect('/login?error=sso_error&message=missing_email');
     }
+    const email = attrs.email.toLowerCase();
 
-    const provisioned = await withSystemDbAccessContext(async () => {
-      // The org named by the claim must exist in Breeze (PixlFlip only points
-      // at pre-existing tenant UUIDs).
-      const [org] = await db
-        .select({ id: organizations.id, partnerId: organizations.partnerId })
-        .from(organizations)
-        .where(eq(organizations.id, breeze.orgId!))
-        .limit(1);
-      if (!org) return { error: 'sso_unknown_org' as const };
+    // Provision per claimed scope and mint a token bound to THAT scope. We never
+    // derive the scope from pre-existing memberships (which could silently
+    // escalate a low-privilege claim), and the claimed tenant must already exist
+    // in Breeze — PixlFlip only references tenant UUIDs, it doesn't create them.
+    const provisioned = await withSystemDbAccessContext(async (): Promise<
+      | { error: string }
+      | {
+          user: typeof users.$inferSelect;
+          scope: 'organization' | 'partner' | 'system';
+          orgId: string | null;
+          partnerId: string | null;
+          roleId: string | null;
+        }
+    > => {
+      if (breeze.scope === 'organization') {
+        if (!breeze.orgId) return { error: 'sso_missing_org' };
+        const [org] = await db
+          .select({ id: organizations.id, partnerId: organizations.partnerId })
+          .from(organizations)
+          .where(eq(organizations.id, breeze.orgId))
+          .limit(1);
+        if (!org) return { error: 'sso_unknown_org' };
 
-      const roleId = await resolveOrgRoleId(org.id, breeze.role, cfg.defaultOrgRole);
-      if (!roleId) return { error: 'sso_role_unresolved' as const };
+        const roleId = await resolveOrgRoleId(org.id, breeze.role, cfg.defaultOrgRole);
+        if (!roleId) return { error: 'sso_role_unresolved' };
 
-      let [user] = await db
-        .select()
-        .from(users)
-        .where(eq(users.email, attrs.email.toLowerCase()))
-        .limit(1);
+        const user = await findOrCreateSsoUser(email, attrs.name, {
+          partnerId: org.partnerId,
+          orgId: org.id
+        });
+        if (!user) return { error: 'sso_user_creation_failed' };
 
-      if (!user) {
-        const [created] = await db
-          .insert(users)
-          .values({
-            partnerId: org.partnerId,
-            orgId: org.id,
-            email: attrs.email.toLowerCase(),
-            name: attrs.name,
-            status: 'active',
-            passwordHash: null // federated users have no local password
-          })
-          .returning();
-        if (!created) return { error: 'sso_user_creation_failed' as const };
-        user = created;
+        const [membership] = await db
+          .select({ roleId: organizationUsers.roleId })
+          .from(organizationUsers)
+          .where(and(eq(organizationUsers.userId, user.id), eq(organizationUsers.orgId, org.id)))
+          .limit(1);
+        if (!membership) {
+          await db.insert(organizationUsers).values({ orgId: org.id, userId: user.id, roleId });
+        }
+
+        const [orgUser] = await db
+          .select({ roleId: organizationUsers.roleId, roleScope: roles.scope })
+          .from(organizationUsers)
+          .innerJoin(roles, eq(roles.id, organizationUsers.roleId))
+          .where(and(eq(organizationUsers.userId, user.id), eq(organizationUsers.orgId, org.id)))
+          .limit(1);
+        if (!orgUser || orgUser.roleScope !== 'organization') {
+          return { error: 'sso_invalid_role_scope' };
+        }
+
+        await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+        return { user, scope: 'organization', orgId: org.id, partnerId: null, roleId: orgUser.roleId };
       }
 
-      // Ensure org membership at the resolved role.
-      const [membership] = await db
-        .select({ roleId: organizationUsers.roleId })
-        .from(organizationUsers)
-        .where(and(eq(organizationUsers.userId, user.id), eq(organizationUsers.orgId, org.id)))
-        .limit(1);
-      if (!membership) {
-        await db.insert(organizationUsers).values({ orgId: org.id, userId: user.id, roleId });
+      if (breeze.scope === 'partner') {
+        if (!breeze.partnerId) return { error: 'sso_missing_partner' };
+        const [partner] = await db
+          .select({ id: partners.id, status: partners.status })
+          .from(partners)
+          .where(eq(partners.id, breeze.partnerId))
+          .limit(1);
+        if (!partner) return { error: 'sso_unknown_partner' };
+        if (partner.status !== 'active') return { error: 'sso_partner_inactive' };
+
+        const roleId = await resolvePartnerRoleId(partner.id, breeze.role, cfg.defaultPartnerRole);
+        if (!roleId) return { error: 'sso_role_unresolved' };
+
+        const user = await findOrCreateSsoUser(email, attrs.name, {
+          partnerId: partner.id,
+          orgId: null
+        });
+        if (!user) return { error: 'sso_user_creation_failed' };
+
+        const [membership] = await db
+          .select({ roleId: partnerUsers.roleId })
+          .from(partnerUsers)
+          .where(and(eq(partnerUsers.userId, user.id), eq(partnerUsers.partnerId, partner.id)))
+          .limit(1);
+        if (!membership) {
+          // Federated partner users see all of the partner's orgs (orgAccess
+          // 'all'); finer-grained selection is a PixlFlip-side concern.
+          await db
+            .insert(partnerUsers)
+            .values({ partnerId: partner.id, userId: user.id, roleId, orgAccess: 'all' });
+        }
+
+        const [partnerUser] = await db
+          .select({ roleId: partnerUsers.roleId, roleScope: roles.scope })
+          .from(partnerUsers)
+          .innerJoin(roles, eq(roles.id, partnerUsers.roleId))
+          .where(and(eq(partnerUsers.userId, user.id), eq(partnerUsers.partnerId, partner.id)))
+          .limit(1);
+        if (!partnerUser || partnerUser.roleScope !== 'partner') {
+          return { error: 'sso_invalid_role_scope' };
+        }
+
+        await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+        return {
+          user,
+          scope: 'partner',
+          orgId: null,
+          partnerId: partner.id,
+          roleId: partnerUser.roleId
+        };
       }
 
-      // Read back the effective org role for the token.
-      const [orgUser] = await db
-        .select({
-          roleId: organizationUsers.roleId,
-          roleScope: roles.scope
-        })
-        .from(organizationUsers)
-        .innerJoin(roles, eq(roles.id, organizationUsers.roleId))
-        .where(and(eq(organizationUsers.userId, user.id), eq(organizationUsers.orgId, org.id)))
-        .limit(1);
-      if (!orgUser || orgUser.roleScope !== 'organization') {
-        return { error: 'sso_invalid_role_scope' as const };
+      if (breeze.scope === 'system') {
+        // Platform admin is the most privileged grant in Breeze; federating it
+        // is opt-in only (PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE).
+        if (!cfg.allowSystemScope) return { error: 'sso_scope_unsupported' };
+        const user = await findOrCreateSsoUser(email, attrs.name, { partnerId: null, orgId: null });
+        if (!user) return { error: 'sso_user_creation_failed' };
+        if (!user.isPlatformAdmin) {
+          await db.update(users).set({ isPlatformAdmin: true }).where(eq(users.id, user.id));
+        }
+        await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+        return { user, scope: 'system', orgId: null, partnerId: null, roleId: null };
       }
 
-      await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
-
-      return { user, orgId: org.id, roleId: orgUser.roleId };
+      return { error: 'sso_scope_unsupported' };
     });
 
     if ('error' in provisioned) {
@@ -430,15 +540,15 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
       return c.redirect(`/login?error=${provisioned.error}`);
     }
 
-    // Mint an organization-scope session (same shape + refresh-family
-    // reuse-detection as the per-org SSO and password logins).
+    // Mint a token bound to the provisioned scope (same payload shape +
+    // refresh-family reuse-detection as password login).
     const tokenPayload = {
       sub: provisioned.user.id,
       email: provisioned.user.email,
       roleId: provisioned.roleId,
       orgId: provisioned.orgId,
-      partnerId: null,
-      scope: 'organization' as const,
+      partnerId: provisioned.partnerId,
+      scope: provisioned.scope,
       mfa: false
     };
 
