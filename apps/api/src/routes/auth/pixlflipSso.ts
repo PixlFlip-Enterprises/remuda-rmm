@@ -42,7 +42,8 @@ import {
   PIXLFLIP_SSO_CLIENT_SECRET,
   PIXLFLIP_SSO_DEFAULT_ORG_ROLE,
   PIXLFLIP_SSO_DEFAULT_PARTNER_ROLE,
-  PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE
+  PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE,
+  PIXLFLIP_SSO_SYSTEM_PARTNER_ID
 } from '../../config/env';
 
 export const pixlflipSsoRoutes = new Hono();
@@ -74,6 +75,7 @@ interface PixlflipSsoConfig {
   defaultOrgRole: string;
   defaultPartnerRole: string;
   allowSystemScope: boolean;
+  systemPartnerId: string;
 }
 
 /**
@@ -92,7 +94,8 @@ export function getPixlflipSsoConfig(): PixlflipSsoConfig | null {
     clientSecret: PIXLFLIP_SSO_CLIENT_SECRET,
     defaultOrgRole: PIXLFLIP_SSO_DEFAULT_ORG_ROLE || 'Org Technician',
     defaultPartnerRole: PIXLFLIP_SSO_DEFAULT_PARTNER_ROLE || 'Partner Technician',
-    allowSystemScope: PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE
+    allowSystemScope: PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE,
+    systemPartnerId: PIXLFLIP_SSO_SYSTEM_PARTNER_ID
   };
 }
 
@@ -248,7 +251,7 @@ async function resolvePartnerRoleId(
 async function findOrCreateSsoUser(
   email: string,
   name: string | undefined,
-  defaults: { partnerId: string | null; orgId: string | null }
+  defaults: { partnerId: string; orgId: string | null }
 ): Promise<typeof users.$inferSelect | null> {
   const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
   if (existing) return existing;
@@ -541,12 +544,41 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
         // Platform admin is the most privileged grant in Breeze; federating it
         // is opt-in only (PIXLFLIP_SSO_ALLOW_SYSTEM_SCOPE).
         if (!cfg.allowSystemScope) return { error: 'sso_scope_unsupported' };
-        const user = await findOrCreateSsoUser(email, attrs.name, { partnerId: null, orgId: null });
+
+        // Every user row needs a partner (users.partner_id is NOT NULL), even a
+        // platform admin. Home them to the claimed partner, else the configured
+        // system partner. (Existing users keep their current partner — this only
+        // matters for the JIT-create path.)
+        const [existing] = await db
+          .select({ id: users.id })
+          .from(users)
+          .where(eq(users.email, email))
+          .limit(1);
+
+        const homePartnerId = breeze.partnerId || cfg.systemPartnerId;
+        if (!existing && !homePartnerId) return { error: 'sso_missing_system_partner' };
+        if (!existing) {
+          const [partner] = await db
+            .select({ id: partners.id, status: partners.status })
+            .from(partners)
+            .where(eq(partners.id, homePartnerId))
+            .limit(1);
+          if (!partner) return { error: 'sso_unknown_partner' };
+          if (partner.status !== 'active') return { error: 'sso_partner_inactive' };
+        }
+
+        const user = await findOrCreateSsoUser(email, attrs.name, {
+          // homePartnerId is only consumed on the create path (validated above);
+          // for an existing user it's ignored.
+          partnerId: homePartnerId,
+          orgId: null
+        });
         if (!user) return { error: 'sso_user_creation_failed' };
         if (!user.isPlatformAdmin) {
           await db.update(users).set({ isPlatformAdmin: true }).where(eq(users.id, user.id));
         }
         await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+        // System tokens carry no tenant (scope=system), matching password login.
         return { user, scope: 'system', orgId: null, partnerId: null, roleId: null };
       }
 
