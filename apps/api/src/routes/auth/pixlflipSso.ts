@@ -4,6 +4,7 @@ import { createHmac, timingSafeEqual } from 'crypto';
 import { db, withSystemDbAccessContext } from '../../db';
 import {
   pixlflipSsoSessions,
+  pixlflipSsoIdentities,
   users,
   organizations,
   organizationUsers,
@@ -269,6 +270,58 @@ async function findOrCreateSsoUser(
   return created ?? null;
 }
 
+/** The Breeze user id previously linked to this PixlFlip identity, if any. */
+async function findLinkedUserId(issuer: string, subject: string): Promise<string | null> {
+  const [link] = await db
+    .select({ userId: pixlflipSsoIdentities.userId })
+    .from(pixlflipSsoIdentities)
+    .where(and(eq(pixlflipSsoIdentities.issuer, issuer), eq(pixlflipSsoIdentities.subject, subject)))
+    .limit(1);
+  return link?.userId ?? null;
+}
+
+/**
+ * Resolve the Breeze user for a PixlFlip identity, preferring the durable
+ * (issuer, subject) link over email. The link is authoritative: `sub` is stable
+ * across email changes, so once linked a renamed/recycled email can't take over
+ * the account. When no link exists we fall back to find-or-create by email and
+ * record the link for next time. Must run inside a system DB-access context.
+ */
+async function resolveSsoUser(
+  issuer: string,
+  subject: string,
+  email: string,
+  name: string | undefined,
+  createDefaults: { partnerId: string; orgId: string | null }
+): Promise<typeof users.$inferSelect | null> {
+  const linkedId = await findLinkedUserId(issuer, subject);
+  if (linkedId) {
+    const [linked] = await db.select().from(users).where(eq(users.id, linkedId)).limit(1);
+    if (linked) {
+      await db
+        .update(pixlflipSsoIdentities)
+        .set({ email, lastLoginAt: new Date() })
+        .where(and(eq(pixlflipSsoIdentities.issuer, issuer), eq(pixlflipSsoIdentities.subject, subject)));
+      return linked;
+    }
+    // Dangling link (user deleted) — fall through and relink to a fresh user.
+  }
+
+  const user = await findOrCreateSsoUser(email, name, createDefaults);
+  if (!user) return null;
+
+  await db
+    .insert(pixlflipSsoIdentities)
+    .values({ userId: user.id, issuer, subject, email, lastLoginAt: new Date() })
+    .onConflictDoUpdate({
+      target: [pixlflipSsoIdentities.issuer, pixlflipSsoIdentities.subject],
+      // Don't re-point an existing link to a different user on a race; only
+      // refresh the email/login timestamp.
+      set: { email, lastLoginAt: new Date() }
+    });
+  return user;
+}
+
 // ============================================
 // Routes
 // ============================================
@@ -433,6 +486,14 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
     }
     const email = attrs.email.toLowerCase();
 
+    // Stable identity coordinates for durable linking (issuer + subject/`sub`).
+    const subject = typeof claims.sub === 'string' ? claims.sub : '';
+    if (!subject) {
+      clearCookie();
+      return c.redirect('/login?error=sso_error&message=missing_subject');
+    }
+    const issuer = cfg.issuer;
+
     // Provision per claimed scope and mint a token bound to THAT scope. We never
     // derive the scope from pre-existing memberships (which could silently
     // escalate a low-privilege claim), and the claimed tenant must already exist
@@ -459,7 +520,7 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
         const roleId = await resolveOrgRoleId(org.id, breeze.role, cfg.defaultOrgRole);
         if (!roleId) return { error: 'sso_role_unresolved' };
 
-        const user = await findOrCreateSsoUser(email, attrs.name, {
+        const user = await resolveSsoUser(issuer, subject, email, attrs.name, {
           partnerId: org.partnerId,
           orgId: org.id
         });
@@ -501,7 +562,7 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
         const roleId = await resolvePartnerRoleId(partner.id, breeze.role, cfg.defaultPartnerRole);
         if (!roleId) return { error: 'sso_role_unresolved' };
 
-        const user = await findOrCreateSsoUser(email, attrs.name, {
+        const user = await resolveSsoUser(issuer, subject, email, attrs.name, {
           partnerId: partner.id,
           orgId: null
         });
@@ -547,17 +608,17 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
 
         // Every user row needs a partner (users.partner_id is NOT NULL), even a
         // platform admin. Home them to the claimed partner, else the configured
-        // system partner. (Existing users keep their current partner — this only
-        // matters for the JIT-create path.)
-        const [existing] = await db
-          .select({ id: users.id })
-          .from(users)
-          .where(eq(users.email, email))
-          .limit(1);
+        // system partner. Only matters on the JIT-create path: if this identity
+        // is already linked or matches an existing email, no create happens.
+        const linkedId = await findLinkedUserId(issuer, subject);
+        const [emailMatch] = linkedId
+          ? []
+          : await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
+        const willCreate = !linkedId && !emailMatch;
 
         const homePartnerId = breeze.partnerId || cfg.systemPartnerId;
-        if (!existing && !homePartnerId) return { error: 'sso_missing_system_partner' };
-        if (!existing) {
+        if (willCreate && !homePartnerId) return { error: 'sso_missing_system_partner' };
+        if (willCreate) {
           const [partner] = await db
             .select({ id: partners.id, status: partners.status })
             .from(partners)
@@ -567,9 +628,9 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
           if (partner.status !== 'active') return { error: 'sso_partner_inactive' };
         }
 
-        const user = await findOrCreateSsoUser(email, attrs.name, {
+        const user = await resolveSsoUser(issuer, subject, email, attrs.name, {
           // homePartnerId is only consumed on the create path (validated above);
-          // for an existing user it's ignored.
+          // for a linked/existing user it's ignored.
           partnerId: homePartnerId,
           orgId: null
         });
