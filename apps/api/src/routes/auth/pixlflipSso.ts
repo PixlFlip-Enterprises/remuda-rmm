@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { eq, and, gt, ilike } from 'drizzle-orm';
+import { eq, and, or, gt, ilike } from 'drizzle-orm';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { db, withSystemDbAccessContext } from '../../db';
 import {
@@ -33,6 +33,7 @@ import {
 } from '../../services';
 import { getTrustedClientIp } from '../../services/clientIp';
 import { createAuditLogAsync } from '../../services/auditService';
+import { ANONYMOUS_ACTOR_ID } from '../../services/auditEvents';
 import { createSsoTokenExchangeGrant } from '../sso';
 import { getCookieValue } from './helpers';
 import {
@@ -199,8 +200,13 @@ function normalizeRedirectPath(input: string | undefined | null): string {
 }
 
 /**
- * Resolve an organization-scope role id within `orgId`, preferring the Breeze
- * role name from the claim, then the configured default. Case-insensitive.
+ * Resolve an organization-scope role id for `orgId`, preferring the Breeze role
+ * name from the claim, then the configured default. Case-insensitive.
+ *
+ * A role is valid for an org if it is a built-in system role (`is_system`, which
+ * the seeded "Org Admin"/"Org Technician"/"Org Viewer" rows are — they carry a
+ * NULL org_id) OR an org-specific custom role. This mirrors the resolution
+ * pattern used elsewhere (`users.ts`, `roles.ts`): `isSystem OR org_id = orgId`.
  */
 async function resolveOrgRoleId(
   orgId: string,
@@ -212,7 +218,13 @@ async function resolveOrgRoleId(
     const [role] = await db
       .select({ id: roles.id })
       .from(roles)
-      .where(and(eq(roles.orgId, orgId), eq(roles.scope, 'organization'), ilike(roles.name, name)))
+      .where(
+        and(
+          eq(roles.scope, 'organization'),
+          or(eq(roles.isSystem, true), eq(roles.orgId, orgId)),
+          ilike(roles.name, name)
+        )
+      )
       .limit(1);
     if (role) return role.id;
   }
@@ -220,9 +232,13 @@ async function resolveOrgRoleId(
 }
 
 /**
- * Resolve a partner-scope role id within `partnerId`, preferring the Breeze
- * role name from the claim, then the configured default. Case-insensitive.
- * Partner roles are seeded per-partner (scope='partner', partner_id set).
+ * Resolve a partner-scope role id for `partnerId`, preferring the Breeze role
+ * name from the claim, then the configured default. Case-insensitive.
+ *
+ * Like org roles, the built-in partner roles ("Partner Admin", etc.) are seeded
+ * as system roles (`is_system`, NULL partner_id), so a role is valid for a
+ * partner when it is a system role OR a partner-specific custom role:
+ * `isSystem OR partner_id = partnerId`.
  */
 async function resolvePartnerRoleId(
   partnerId: string,
@@ -234,7 +250,13 @@ async function resolvePartnerRoleId(
     const [role] = await db
       .select({ id: roles.id })
       .from(roles)
-      .where(and(eq(roles.partnerId, partnerId), eq(roles.scope, 'partner'), ilike(roles.name, name)))
+      .where(
+        and(
+          eq(roles.scope, 'partner'),
+          or(eq(roles.isSystem, true), eq(roles.partnerId, partnerId)),
+          ilike(roles.name, name)
+        )
+      )
       .limit(1);
     if (role) return role.id;
   }
@@ -591,7 +613,12 @@ pixlflipSsoRoutes.get('/callback', async (c) => {
       // a rejected scope is visible, not just silent on the login screen.
       void createAuditLogAsync({
         actorType: 'system',
-        actorId: 'pixlflip-sso',
+        // actor_id is a uuid column; there is no user row on the denied path, so
+        // use the sentinel anonymous actor (the identity is captured in
+        // actorEmail + details.method) rather than the literal 'pixlflip-sso',
+        // which previously threw "invalid input syntax for type uuid" and
+        // silently dropped the denial audit.
+        actorId: ANONYMOUS_ACTOR_ID,
         actorEmail: email,
         action: 'user.login',
         resourceType: 'user',
