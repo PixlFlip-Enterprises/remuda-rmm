@@ -283,7 +283,9 @@ async function findOrCreateSsoUser(
       partnerId: defaults.partnerId,
       orgId: defaults.orgId,
       email,
-      name,
+      // users.name is NOT NULL; the IdP may omit `name` (it's not in the
+      // requested scopes for every provider), so fall back to the email.
+      name: name ?? email,
       status: 'active',
       passwordHash: null // federated users have no local password
     })
