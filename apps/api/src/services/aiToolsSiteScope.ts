@@ -55,6 +55,36 @@ export async function resolveSiteAllowedDeviceIds(
 }
 
 /**
+ * Partition an org's devices into the caller's in-scope (`allowed`) and
+ * out-of-site-scope (`forbidden`) sets in a single query. Returns `null` when
+ * the caller is NOT site-restricted (no narrowing needed).
+ *
+ * The `forbidden` set is the complement of `allowed` over the org's devices and
+ * lets a caller exclude rows that *reference* an out-of-scope fleet device by id
+ * (e.g. via `details.deviceId`) WITHOUT over-excluding rows whose device-id
+ * field holds an id that is not a fleet device at all (e.g. an authenticator
+ * credential id) — only real out-of-site-scope org devices land in `forbidden`.
+ * Prefer this over calling `resolveSiteAllowedDeviceIds` and a separate
+ * forbidden lookup when both partitions are needed (one device scan, not two).
+ */
+export async function resolveSiteDevicePartition(
+  orgId: string,
+  auth: AuthContext,
+): Promise<{ allowed: string[]; forbidden: string[] } | null> {
+  if (!auth.allowedSiteIds || !auth.canAccessSite) return null;
+  const orgDevices = await db
+    .select({ id: devices.id, siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.orgId, orgId));
+  const allowed: string[] = [];
+  const forbidden: string[] = [];
+  for (const d of orgDevices) {
+    (auth.canAccessSite!(d.siteId) ? allowed : forbidden).push(d.id);
+  }
+  return { allowed, forbidden };
+}
+
+/**
  * True when a site-restricted caller must be denied access to a device with the
  * given `siteId`. Fails closed: a null-site device is denied for a restricted
  * caller. Always false (allow) for an unrestricted caller. Use this for tools
