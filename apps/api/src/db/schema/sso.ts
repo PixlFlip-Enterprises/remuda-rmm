@@ -129,3 +129,22 @@ export const pixlflipSsoSessions = pgTable('pixlflip_sso_sessions', {
 }, (t) => ({
   expiresAtIdx: index('pixlflip_sso_sessions_expires_at_idx').on(t.expiresAt)
 }));
+
+// Durable link between a PixlFlip identity (issuer + subject/`sub`) and a Breeze
+// user. The authoritative match for federated login — `sub` is stable across
+// email changes, so linking by it (not email alone) prevents email-reuse
+// takeover. Like the per-org `userSsoIdentities` but WITHOUT a provider FK, since
+// the PixlFlip provider is global/env-configured. User-id-scoped (shape 6): RLS
+// in the migration; see USER_ID_SCOPED_TABLES in rls-coverage.
+export const pixlflipSsoIdentities = pgTable('pixlflip_sso_identities', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  issuer: varchar('issuer', { length: 255 }).notNull(),
+  subject: varchar('subject', { length: 255 }).notNull(),
+  email: varchar('email', { length: 255 }),
+  lastLoginAt: timestamp('last_login_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+}, (t) => ({
+  issuerSubjectUnique: uniqueIndex('pixlflip_sso_identities_issuer_subject_unique').on(t.issuer, t.subject),
+  userIdIdx: index('pixlflip_sso_identities_user_id_idx').on(t.userId)
+}));

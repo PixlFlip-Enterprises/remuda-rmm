@@ -293,6 +293,9 @@ const PARENT_FK_JOIN_POLICY_TABLES: ReadonlyMap<string, readonly string[]> = new
 // (Phase 6 migration).
 const USER_ID_SCOPED_TABLES: ReadonlySet<string> = new Set<string>([
   'user_sso_identities',
+  // PixlFlip federated identity links (issuer+subject → user). Shape 6,
+  // same policy as user_sso_identities; written via system DB context.
+  'pixlflip_sso_identities',
   'push_notifications',
   'mobile_devices',
   // ticket_comments: Shape 6 on the author axis, PLUS an extra permissive
