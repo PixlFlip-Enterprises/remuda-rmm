@@ -12,6 +12,7 @@ import {
   configPolicySensitiveDataSettings,
   configPolicyMonitoringSettings,
   configPolicyMonitoringWatches,
+  configPolicyRemoteAccessSettings,
   configPolicyBackupSettings,
   devices,
   deviceGroups,
@@ -38,6 +39,17 @@ import { resolvePartnerIdForOrg } from '../routes/patches/helpers';
 // ============================================
 // Inline settings schemas
 // ============================================
+
+// Remote access session consent/notification settings.
+// Exported so routes can import the same schema (single source of truth).
+// All fields are optional with spec-defined defaults so {} is always valid.
+export const remoteAccessInlineSettingsSchema = z.object({
+  sessionPromptMode: z.enum(['off', 'notify', 'consent']).default('notify'),
+  consentUnavailableBehavior: z.enum(['proceed', 'block']).default('proceed'),
+  notifyOnSessionEnd: z.boolean().default(true),
+  showActiveIndicator: z.boolean().default(true),
+  technicianIdentityLevel: z.enum(['name_email', 'name', 'generic']).default('name_email'),
+}).strict();
 
 // Exported so the route can import the same schema (single source of truth).
 // uacInterceptionEnabled defaults to true on the read side (parsePamSettings),
@@ -470,9 +482,21 @@ async function decomposeInlineSettings(
       break;
     }
 
+    case 'remote_access': {
+      const parsed = remoteAccessInlineSettingsSchema.parse(s);
+      await tx.insert(configPolicyRemoteAccessSettings).values({
+        featureLinkId: linkId,
+        sessionPromptMode: parsed.sessionPromptMode,
+        consentUnavailableBehavior: parsed.consentUnavailableBehavior,
+        notifyOnSessionEnd: parsed.notifyOnSessionEnd,
+        showActiveIndicator: parsed.showActiveIndicator,
+        technicianIdentityLevel: parsed.technicianIdentityLevel,
+      });
+      break;
+    }
+
     case 'warranty':
     case 'helper':
-    case 'remote_access':
     case 'pam':
       // Pure JSONB — no normalized table needed
       break;
@@ -524,9 +548,11 @@ async function deleteNormalizedRows(
     case 'backup':
       await tx.delete(configPolicyBackupSettings).where(eq(configPolicyBackupSettings.featureLinkId, linkId));
       break;
+    case 'remote_access':
+      await tx.delete(configPolicyRemoteAccessSettings).where(eq(configPolicyRemoteAccessSettings.featureLinkId, linkId));
+      break;
     case 'warranty':
     case 'helper':
-    case 'remote_access':
     case 'pam':
       // Pure JSONB — no normalized table to delete
       break;
@@ -786,9 +812,24 @@ async function assembleInlineSettings(
       };
     }
 
+    case 'remote_access': {
+      const [row] = await db
+        .select()
+        .from(configPolicyRemoteAccessSettings)
+        .where(eq(configPolicyRemoteAccessSettings.featureLinkId, linkId))
+        .limit(1);
+      if (!row) return null;
+      return {
+        sessionPromptMode: row.sessionPromptMode,
+        consentUnavailableBehavior: row.consentUnavailableBehavior,
+        notifyOnSessionEnd: row.notifyOnSessionEnd,
+        showActiveIndicator: row.showActiveIndicator,
+        technicianIdentityLevel: row.technicianIdentityLevel,
+      };
+    }
+
     case 'warranty':
     case 'helper':
-    case 'remote_access':
     case 'pam':
       // Pure JSONB — settings stored directly on feature link
       return null;
