@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -10,9 +10,11 @@ import {
   Loader2,
   RefreshCw,
   Save,
+  Search,
   Shield,
   Unplug,
-  Webhook
+  Webhook,
+  X
 } from 'lucide-react';
 import { fetchWithAuth, resolveApiOrigin } from '../../stores/auth';
 import { type Organization, useOrgStore } from '../../stores/orgStore';
@@ -28,8 +30,27 @@ type Integration = {
   lastSyncAt: string | null;
   lastSyncStatus: string | null;
   lastSyncError: string | null;
+  lastSyncAgents: number | null;
+  lastSyncIncidents: number | null;
+  lastSyncOrgs: number | null;
+  // Bumped on every status write (running/success/error), so the poll can detect
+  // "this run wrote something new" without depending on lastSyncAt (which only
+  // advances on success) or on having witnessed the best-effort 'running' write.
+  updatedAt: string | null;
   hasWebhookSecret: boolean;
 };
+
+// After triggering a sync we poll the integration row to a terminal state
+// (running → success/error) rather than guessing with a single fixed timeout —
+// the Huntress fetch alone is ~20s, so a 3s reload always showed stale state
+// (#1736).
+const SYNC_POLL_INTERVAL_MS = 2500;
+const SYNC_POLL_MAX_MS = 120_000;
+// Stop polling and report an error once this many *consecutive* status reads
+// fail, rather than silently spinning to the deadline on a persistently broken
+// endpoint.
+const SYNC_POLL_MAX_FAILURES = 4;
+const MAPPING_PAGE_SIZE = 25;
 
 type StatusSummary = {
   totalAgents: number;
@@ -65,7 +86,7 @@ type HuntressOrgMapping = {
 };
 
 type SaveState = { status: 'idle' | 'saving' | 'saved' | 'error'; message?: string };
-type SyncState = { status: 'idle' | 'syncing' | 'done' | 'error'; message?: string };
+type SyncState = { status: 'idle' | 'syncing' | 'done' | 'warning' | 'error'; message?: string };
 
 const LIVE_STATUS_ERROR =
   'Live Huntress status could not be fully loaded. Coverage and incident data below may be incomplete or out of date.';
@@ -92,6 +113,19 @@ function readError(json: unknown, fallback: string): string {
     return String((json as { error?: unknown }).error ?? fallback);
   }
   return fallback;
+}
+
+function pluralize(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
+}
+
+// "Synced 12 agents · 3 incidents · 26 orgs" from the persisted last-run counts.
+function formatSyncResult(integration: Integration): string {
+  const parts: string[] = [];
+  if (typeof integration.lastSyncAgents === 'number') parts.push(pluralize(integration.lastSyncAgents, 'agent'));
+  if (typeof integration.lastSyncIncidents === 'number') parts.push(pluralize(integration.lastSyncIncidents, 'incident'));
+  if (typeof integration.lastSyncOrgs === 'number') parts.push(pluralize(integration.lastSyncOrgs, 'org'));
+  return parts.length > 0 ? `Synced ${parts.join(' · ')}` : 'Sync complete';
 }
 
 function syncStatusBadge(integration: Integration | null) {
@@ -158,6 +192,14 @@ export default function HuntressIntegration() {
   const [syncState, setSyncState] = useState<SyncState>({ status: 'idle' });
   const [mappingSaving, setMappingSaving] = useState<Record<string, boolean>>({});
   const [mappingError, setMappingError] = useState<string | null>(null);
+  const [mappingSearch, setMappingSearch] = useState('');
+  const [showUnmappedOnly, setShowUnmappedOnly] = useState(false);
+  const [mappingPage, setMappingPage] = useState(0);
+
+  // Each sync run gets a monotonic token; the poll loop bails the moment a newer
+  // run starts or the component unmounts, so stale polls never clobber state.
+  const syncPollRef = useRef(0);
+  useEffect(() => () => { syncPollRef.current = -1; }, []);
 
   const currentOrgId = useOrgStore((s) => s.currentOrgId);
   const isPartnerView = !currentOrgId;
@@ -190,12 +232,46 @@ export default function HuntressIntegration() {
     setGeneratedSecretNotice(true);
   };
 
-  const fetchIntegration = useCallback(async () => {
+  const filteredOrgs = useMemo(() => {
+    const q = mappingSearch.trim().toLowerCase();
+    return huntressOrgs.filter((row) => {
+      if (showUnmappedOnly && row.mappedOrgId) return false;
+      if (!q) return true;
+      return (
+        (row.huntressOrgName ?? '').toLowerCase().includes(q)
+        || row.huntressOrgId.toLowerCase().includes(q)
+        || (row.huntressOrgKey ?? '').toLowerCase().includes(q)
+        || (row.mappedOrgName ?? '').toLowerCase().includes(q)
+      );
+    });
+  }, [huntressOrgs, mappingSearch, showUnmappedOnly]);
+
+  const pageCount = Math.max(1, Math.ceil(filteredOrgs.length / MAPPING_PAGE_SIZE));
+  const safePage = Math.min(mappingPage, pageCount - 1);
+  const pagedOrgs = useMemo(
+    () => filteredOrgs.slice(safePage * MAPPING_PAGE_SIZE, safePage * MAPPING_PAGE_SIZE + MAPPING_PAGE_SIZE),
+    [filteredOrgs, safePage]
+  );
+
+  // Snap back to the first page whenever the result set changes underneath us.
+  useEffect(() => { setMappingPage(0); }, [mappingSearch, showUnmappedOnly]);
+
+  // Raw read used by both the initial load and the post-sync poll. Kept separate
+  // from fetchIntegration so polling does NOT reset the credential/name form
+  // fields the user may be editing.
+  const fetchIntegrationData = useCallback(async (): Promise<{ data: Integration | null; mapped: boolean }> => {
     const res = await fetchWithAuth('/huntress/integration');
     const json = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(readError(json, `Failed to load integration (${res.status})`));
-    const data = (json as { data?: Integration | null; mapped?: boolean }).data ?? null;
-    setMappedForOrg((json as { mapped?: boolean }).mapped !== false);
+    return {
+      data: (json as { data?: Integration | null }).data ?? null,
+      mapped: (json as { mapped?: boolean }).mapped !== false,
+    };
+  }, []);
+
+  const fetchIntegration = useCallback(async () => {
+    const { data, mapped } = await fetchIntegrationData();
+    setMappedForOrg(mapped);
     setIntegration(data);
     if (data) {
       setName(data.name);
@@ -203,7 +279,7 @@ export default function HuntressIntegration() {
       setApiKey('');
       setApiSecret('');
     }
-  }, []);
+  }, [fetchIntegrationData]);
 
   const fetchStatus = useCallback(async () => {
     const res = await fetchWithAuth('/huntress/status');
@@ -299,7 +375,13 @@ export default function HuntressIntegration() {
 
   const handleSync = async () => {
     if (!isPartnerView) return;
-    setSyncState({ status: 'syncing' });
+    // updatedAt is bumped by every status write, so "row changed since we started"
+    // detects this run's terminal write regardless of whether the best-effort
+    // 'running' write landed and without waiting on lastSyncAt (success-only).
+    const baselineUpdatedAt = integration?.updatedAt ?? null;
+    const token = ++syncPollRef.current;
+    setSyncState({ status: 'syncing', message: 'Sync queued…' });
+
     try {
       const res = await fetchWithAuth('/huntress/sync', { method: 'POST', body: JSON.stringify({}) });
       const json = await res.json().catch(() => ({}));
@@ -307,13 +389,79 @@ export default function HuntressIntegration() {
         setSyncState({ status: 'error', message: readError(json, `Sync failed (${res.status})`) });
         return;
       }
-      setSyncState({ status: 'done', message: 'Sync triggered' });
-      setTimeout(() => {
-        void load();
-      }, 3000);
     } catch (err) {
       setSyncState({ status: 'error', message: err instanceof Error ? err.message : 'Network error' });
+      return;
     }
+
+    // Resolve `data.lastSyncStatus` to the syncState the UI should show, or null
+    // if the row hasn't reached a terminal write for THIS run yet (keep polling).
+    const settle = (data: Integration | null): SyncState | null => {
+      if (!data) return null;
+      const changed = data.updatedAt !== baselineUpdatedAt;
+      if (data.lastSyncStatus === 'success' && changed) return { status: 'done', message: formatSyncResult(data) };
+      if (data.lastSyncStatus === 'error' && changed) return { status: 'error', message: data.lastSyncError ?? 'Sync failed' };
+      return null;
+    };
+
+    // Poll the integration row until it reaches a terminal state, so we can
+    // report the actual outcome — counts on success, the error otherwise —
+    // instead of a static "Sync triggered" that proves nothing (the Huntress
+    // fetch alone is ~20s, and BullMQ may retry across several attempts).
+    const deadline = Date.now() + SYNC_POLL_MAX_MS;
+    let consecutiveFailures = 0;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, SYNC_POLL_INTERVAL_MS));
+      if (syncPollRef.current !== token) return; // superseded or unmounted
+
+      let data: Integration | null;
+      try {
+        ({ data } = await fetchIntegrationData());
+      } catch (err) {
+        // Don't silently ride a broken endpoint to the deadline: log every
+        // failed read and bail with a real error after several in a row.
+        consecutiveFailures += 1;
+        console.warn('[HuntressIntegration] Failed to poll sync status:', err);
+        if (consecutiveFailures >= SYNC_POLL_MAX_FAILURES) {
+          if (syncPollRef.current !== token) return;
+          setSyncState({ status: 'error', message: 'Could not read sync status. Refresh to check the latest state.' });
+          return;
+        }
+        continue;
+      }
+      if (syncPollRef.current !== token) return;
+      consecutiveFailures = 0;
+
+      if (data?.lastSyncStatus === 'running') {
+        setSyncState({ status: 'syncing', message: 'Syncing…' });
+        continue;
+      }
+      const settled = settle(data);
+      if (settled) {
+        setSyncState(settled);
+        await load();
+        return;
+      }
+    }
+
+    // Deadline hit. Do one final read so we report the truth — success/error if
+    // it just landed, otherwise a neutral "still running" (NOT a green "done").
+    if (syncPollRef.current !== token) return;
+    try {
+      const { data } = await fetchIntegrationData();
+      if (syncPollRef.current !== token) return;
+      const settled = settle(data);
+      if (settled) {
+        setSyncState(settled);
+        await load();
+        return;
+      }
+    } catch (err) {
+      console.warn('[HuntressIntegration] Final sync-status read failed:', err);
+    }
+    if (syncPollRef.current !== token) return;
+    setSyncState({ status: 'warning', message: 'Sync is taking longer than expected — it will finish in the background.' });
+    await load();
   };
 
   const handleMap = async (huntressOrgId: string, orgId: string | null) => {
@@ -508,7 +656,7 @@ export default function HuntressIntegration() {
               <span className={`text-sm ${saveState.status === 'error' ? 'text-red-600' : 'text-emerald-600'}`}>{saveState.message}</span>
             )}
             {syncState.message && (
-              <span className={`text-sm ${syncState.status === 'error' ? 'text-red-600' : 'text-emerald-600'}`}>{syncState.message}</span>
+              <span className={`text-sm ${syncState.status === 'error' ? 'text-red-600' : syncState.status === 'warning' ? 'text-amber-600' : 'text-emerald-600'}`}>{syncState.message}</span>
             )}
           </div>
         </div>
@@ -588,8 +736,16 @@ export default function HuntressIntegration() {
                 <span>Last sync</span>
                 <span className="text-foreground">{integration.lastSyncAt ? formatDateTime(integration.lastSyncAt) : 'Never'}</span>
               </div>
-              {integration.lastSyncError && (
-                <div className="rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-700">{integration.lastSyncError}</div>
+              {integration.lastSyncStatus === 'success' && (
+                <div className="flex justify-between text-muted-foreground">
+                  <span>Last result</span>
+                  <span className="text-foreground">{formatSyncResult(integration)}</span>
+                </div>
+              )}
+              {integration.lastSyncStatus === 'error' && integration.lastSyncError && (
+                <div className="rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-700">
+                  <span className="font-medium">Last sync failed:</span> {integration.lastSyncError}
+                </div>
               )}
             </div>
           </div>
@@ -639,8 +795,43 @@ export default function HuntressIntegration() {
             )}
           </div>
           {mappingError && <div className="mt-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{mappingError}</div>}
+
+          {huntressOrgs.length > 0 && (
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              <div className="relative flex-1 min-w-[200px]">
+                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  type="text"
+                  value={mappingSearch}
+                  onChange={(event) => setMappingSearch(event.target.value)}
+                  placeholder="Search Huntress or Breeze organizations"
+                  className="h-9 w-full rounded-md border bg-background pl-9 pr-8 text-sm outline-none focus:ring-2 focus:ring-primary/30"
+                />
+                {mappingSearch && (
+                  <button
+                    type="button"
+                    aria-label="Clear search"
+                    onClick={() => setMappingSearch('')}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
+              <label className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={showUnmappedOnly}
+                  onChange={(event) => setShowUnmappedOnly(event.target.checked)}
+                  className="h-4 w-4 rounded border-input"
+                />
+                Unmapped only
+              </label>
+            </div>
+          )}
+
           <div className="mt-4 overflow-x-auto">
-            <table className="w-full min-w-[760px] text-sm">
+            <table className="w-full min-w-[820px] text-sm">
               <thead>
                 <tr className="border-b text-left text-xs font-semibold uppercase text-muted-foreground">
                   <th className="pb-2 pr-4">Huntress org</th>
@@ -651,7 +842,7 @@ export default function HuntressIntegration() {
                 </tr>
               </thead>
               <tbody>
-                {huntressOrgs.map((row) => (
+                {pagedOrgs.map((row) => (
                   <tr key={row.huntressOrgId} className="border-b last:border-0">
                     <td className="py-3 pr-4">
                       <div className="font-medium">{row.huntressOrgName || row.huntressOrgId}</div>
@@ -662,17 +853,29 @@ export default function HuntressIntegration() {
                     <td className="py-3 pr-4 text-muted-foreground">{row.agentsCount}</td>
                     <td className="py-3 pr-4 text-muted-foreground">{row.incidentsCount}</td>
                     <td className="py-3 pr-4">
-                      <select
-                        value={row.mappedOrgId ?? ''}
-                        onChange={(event) => void handleMap(row.huntressOrgId, event.target.value || null)}
-                        disabled={mappingSaving[row.huntressOrgId]}
-                        className="h-9 w-full max-w-xs rounded-md border bg-background px-2 text-sm outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50"
-                      >
-                        <option value="">Select organization</option>
-                        {orgOptions.map((org) => (
-                          <option key={org.id} value={org.id}>{org.name}</option>
-                        ))}
-                      </select>
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={row.mappedOrgId ?? ''}
+                          onChange={(event) => void handleMap(row.huntressOrgId, event.target.value || null)}
+                          disabled={mappingSaving[row.huntressOrgId]}
+                          className="h-9 w-full max-w-xs rounded-md border bg-background px-2 text-sm outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50"
+                        >
+                          <option value="">Select organization</option>
+                          {orgOptions.map((org) => (
+                            <option key={org.id} value={org.id}>{org.name}</option>
+                          ))}
+                        </select>
+                        {row.mappedOrgId && (
+                          <button
+                            type="button"
+                            onClick={() => void handleMap(row.huntressOrgId, null)}
+                            disabled={mappingSaving[row.huntressOrgId]}
+                            className="inline-flex h-9 shrink-0 items-center gap-1 rounded-md border px-2 text-xs font-medium text-muted-foreground hover:bg-muted disabled:opacity-50"
+                          >
+                            <Unplug className="h-3.5 w-3.5" /> Unmap
+                          </button>
+                        )}
+                      </div>
                     </td>
                     <td className="py-3">
                       {mappingSaving[row.huntressOrgId] ? (
@@ -692,9 +895,43 @@ export default function HuntressIntegration() {
                     </td>
                   </tr>
                 )}
+                {huntressOrgs.length > 0 && filteredOrgs.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="py-6 text-sm text-muted-foreground">
+                      No organizations match the current filter.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
+
+          {filteredOrgs.length > MAPPING_PAGE_SIZE && (
+            <div className="mt-4 flex items-center justify-between text-sm text-muted-foreground">
+              <span>
+                Showing {safePage * MAPPING_PAGE_SIZE + 1}–{Math.min((safePage + 1) * MAPPING_PAGE_SIZE, filteredOrgs.length)} of {filteredOrgs.length}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setMappingPage((page) => Math.max(0, page - 1))}
+                  disabled={safePage === 0}
+                  className="inline-flex h-8 items-center rounded-md border px-3 hover:bg-muted disabled:opacity-50"
+                >
+                  Previous
+                </button>
+                <span className="text-foreground">Page {safePage + 1} of {pageCount}</span>
+                <button
+                  type="button"
+                  onClick={() => setMappingPage((page) => Math.min(pageCount - 1, page + 1))}
+                  disabled={safePage >= pageCount - 1}
+                  className="inline-flex h-8 items-center rounded-md border px-3 hover:bg-muted disabled:opacity-50"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

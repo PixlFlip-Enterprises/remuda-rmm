@@ -35,6 +35,19 @@ const DEFAULT_SYNC_INTERVAL_MINUTES = 15;
 const DEFAULT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const EVENT_PUBLISH_CONCURRENCY = 10;
 
+// #1736 — a per-integration sync persists agents/incidents in one transaction.
+// Transient US managed-Postgres connection drops (CONNECTION_CLOSED under the
+// 25-conn pool ceiling) were failing the whole job with NO retry, so the
+// per-agent/per-incident rows were never persisted and Coverage stayed at zero.
+// The upserts are idempotent (onConflictDoUpdate), so retrying with backoff is
+// safe and recovers from a transient drop without operator intervention.
+const SYNC_INTEGRATION_JOB_OPTS: Omit<JobsOptions, 'jobId'> = {
+  removeOnComplete: { count: 50 },
+  removeOnFail: { count: 200 },
+  attempts: 3,
+  backoff: { type: 'exponential', delay: 5000 },
+};
+
 interface SyncAllJobData {
   type: 'sync-all';
 }
@@ -715,8 +728,15 @@ async function upsertIncidents(params: {
 export async function syncIntegrationById(
   integrationId: string,
   source: 'manual' | 'scheduled' | 'webhook' = 'scheduled',
-  webhookPayload?: { agents: HuntressAgentRecord[]; incidents: HuntressIncidentRecord[]; }
+  webhookPayload?: { agents: HuntressAgentRecord[]; incidents: HuntressIncidentRecord[]; },
+  // #1736 — when this run is one of several BullMQ retry attempts, only the
+  // FINAL attempt records a terminal 'error'; earlier attempts leave the row at
+  // 'running' so the UI doesn't flash a failure that a successful retry then
+  // silently corrects. Defaults to true so the webhook / direct-call paths (no
+  // retry) keep recording errors immediately.
+  options: { isFinalAttempt?: boolean } = {}
 ): Promise<HuntressSyncResult> {
+  const isFinalAttempt = options.isFinalAttempt ?? true;
   // Phase 1 — load the integration row in its own short DB context, kept
   // separate from the write phase so the external Huntress fetch below holds
   // NO open transaction (#1697). Pinning a pooled connection across the ~20s
@@ -743,6 +763,31 @@ export async function syncIntegrationById(
       createdIncidents: 0,
       updatedIncidents: 0,
     };
+  }
+
+  // Mark the integration as actively syncing (#1736) so the UI can poll a
+  // definitive running → terminal transition and stop guessing with a one-shot
+  // timeout. Only on the queued (scheduled/manual) path: the webhook path runs
+  // synchronously inside the caller's DB context, so a 'running' write there
+  // would commit atomically with the final status and never be observable —
+  // skip the extra write. Best-effort: a failure to flip the badge must never
+  // abort the sync itself.
+  if (!webhookPayload) {
+    try {
+      await runWithSystemDbAccess(() =>
+        db
+          .update(huntressIntegrations)
+          .set({ lastSyncStatus: 'running', lastSyncError: null, updatedAt: new Date() })
+          .where(eq(huntressIntegrations.id, integration.id))
+      );
+    } catch (err) {
+      // A 'running'-write failure here usually means the connection pool is
+      // starved — the exact #1697/#1105 condition this split-phase design exists
+      // to mitigate — so surface it to Sentry like the file's other catches, but
+      // still proceed: a cosmetic badge flip must never abort an idempotent sync.
+      console.warn(`[HuntressSync] Failed to mark integration ${integrationId} as running:`, err);
+      captureException(err instanceof Error ? err : new Error(String(err)));
+    }
   }
 
   try {
@@ -838,12 +883,18 @@ export async function syncIntegrationById(
         updatedIncidents += incidentResult.updated;
       }
 
+      // Persist this run's result counts (#1736) in the SAME transaction as the
+      // success status + lastSyncAt, so the counts the UI shows can never get
+      // out of step with "succeeded at <lastSyncAt>".
       await db
         .update(huntressIntegrations)
         .set({
           lastSyncAt: new Date(),
           lastSyncStatus: 'success',
           lastSyncError: null,
+          lastSyncAgents: upsertedAgents,
+          lastSyncIncidents: createdIncidents + updatedIncidents,
+          lastSyncOrgs: discoveredOrganizations.length,
           updatedAt: new Date(),
         })
         .where(eq(huntressIntegrations.id, integration.id));
@@ -862,29 +913,37 @@ export async function syncIntegrationById(
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    try {
-      // Record the failure on a FRESH transaction. Phase 3's write transaction
-      // (or, on the webhook path, the caller's outer context) is rolling back as
-      // we unwind, so recording the failure on that same connection would be
-      // undone and the row would keep its stale status. Escape the current
-      // context (runOutsideDbContext) and open a new transaction
-      // (runWithSystemDbAccess) so the 'error' status commits and survives the
-      // rollback.
-      await dbModule.runOutsideDbContext(() =>
-        runWithSystemDbAccess(() =>
-          db
-            .update(huntressIntegrations)
-            .set({
-              lastSyncStatus: 'error',
-              lastSyncError: `${source}: ${message}`.slice(0, 2000),
-              updatedAt: new Date(),
-            })
-            .where(eq(huntressIntegrations.id, integrationId))
-        )
-      );
-    } catch (dbErr) {
-      console.error(`[HuntressSync] Failed to record sync error for integration ${integrationId}:`, dbErr);
-      captureException(dbErr instanceof Error ? dbErr : new Error(String(dbErr)));
+    // Only the final attempt records a terminal 'error' (#1736). On an earlier
+    // retry attempt we re-throw without touching the status, leaving the row at
+    // 'running' so BullMQ can back off and retry while the UI keeps showing
+    // "Syncing" — writing 'error' mid-retry would surface a failure that a
+    // successful later attempt then silently corrects. Always re-throw so BullMQ
+    // sees the failed attempt and schedules the retry / runs its failed handler.
+    if (isFinalAttempt) {
+      try {
+        // Record the failure on a FRESH transaction. Phase 3's write transaction
+        // (or, on the webhook path, the caller's outer context) is rolling back as
+        // we unwind, so recording the failure on that same connection would be
+        // undone and the row would keep its stale status. Escape the current
+        // context (runOutsideDbContext) and open a new transaction
+        // (runWithSystemDbAccess) so the 'error' status commits and survives the
+        // rollback.
+        await dbModule.runOutsideDbContext(() =>
+          runWithSystemDbAccess(() =>
+            db
+              .update(huntressIntegrations)
+              .set({
+                lastSyncStatus: 'error',
+                lastSyncError: `${source}: ${message}`.slice(0, 2000),
+                updatedAt: new Date(),
+              })
+              .where(eq(huntressIntegrations.id, integrationId))
+          )
+        );
+      } catch (dbErr) {
+        console.error(`[HuntressSync] Failed to record sync error for integration ${integrationId}:`, dbErr);
+        captureException(dbErr instanceof Error ? dbErr : new Error(String(dbErr)));
+      }
     }
     throw error;
   }
@@ -918,14 +977,22 @@ async function processSyncAll(): Promise<{ queued: number }> {
     'sync-integration',
     { type: 'sync-integration', integrationId: integration.id },
     `huntress-sync-integration-${integration.id}`,
-    { removeOnComplete: { count: 50 }, removeOnFail: { count: 200 } }
+    SYNC_INTEGRATION_JOB_OPTS
   )));
 
   return { queued: due.length };
 }
 
-async function processSyncIntegration(data: SyncIntegrationJobData): Promise<HuntressSyncResult> {
-  return syncIntegrationById(data.integrationId, 'scheduled');
+async function processSyncIntegration(
+  data: SyncIntegrationJobData,
+  job: Job<HuntressSyncJobData>
+): Promise<HuntressSyncResult> {
+  // BullMQ increments attemptsMade on move-to-active, so inside the processor it
+  // is 1-based: the final attempt is `attemptsMade >= attempts` (matches the
+  // ticketNotify/inboundEmail worker convention). Only the final attempt records
+  // a terminal 'error'; earlier attempts leave the row 'running' for the retry.
+  const isFinalAttempt = job.attemptsMade >= (job.opts.attempts ?? 1);
+  return syncIntegrationById(data.integrationId, 'scheduled', undefined, { isFinalAttempt });
 }
 
 export async function scheduleHuntressSync(integrationId?: string): Promise<string> {
@@ -936,7 +1003,7 @@ export async function scheduleHuntressSync(integrationId?: string): Promise<stri
       'sync-integration',
       { type: 'sync-integration', integrationId },
       `huntress-sync-integration-${integrationId}`,
-      { removeOnComplete: { count: 50 }, removeOnFail: { count: 200 } }
+      SYNC_INTEGRATION_JOB_OPTS
     );
   }
 
@@ -1012,7 +1079,7 @@ function createHuntressSyncWorker(): Worker<HuntressSyncJobData> {
         case 'sync-all':
           return processSyncAll();
         case 'sync-integration':
-          return processSyncIntegration(job.data);
+          return processSyncIntegration(job.data, job);
         default:
           throw new Error(`Unknown Huntress sync job type: ${(job.data as { type: string }).type}`);
       }
