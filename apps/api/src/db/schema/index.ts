@@ -95,3 +95,4 @@ export * from './remediationSuggestions';
 export * from './pax8';
 export * from './accounting';
 export * from './onedriveHelper';
+export * from './vulnerabilityManagement';

@@ -95,6 +95,7 @@ import { monitoringRoutes } from './routes/monitoring';
 import { auditBaselineRoutes } from './routes/auditBaselines';
 import { softwareRoutes } from './routes/software';
 import { softwarePoliciesRoutes } from './routes/softwarePolicies';
+import { vulnerabilityRoutes, vulnerabilitySyncRoutes } from './routes/vulnerabilities';
 import { systemRoutes } from './routes/system';
 import { systemToolsRoutes } from './routes/systemTools';
 import { notificationRoutes } from './routes/notifications';
@@ -193,6 +194,7 @@ import { initializeUserRiskJobs, shutdownUserRiskJobs } from './jobs/userRiskJob
 import { initializeUserRiskRetention, shutdownUserRiskRetention } from './jobs/userRiskRetention';
 import { initializePatchComplianceReportWorker, shutdownPatchComplianceReportWorker } from './jobs/patchComplianceReportWorker';
 import { initializeCveEnrichmentWorker, shutdownCveEnrichmentWorker } from './jobs/cveEnrichmentWorker';
+import { initializeVulnerabilityJobs, shutdownVulnerabilityJobs } from './jobs/vulnerabilityJobs';
 import { initializeSoftwareComplianceWorker, shutdownSoftwareComplianceWorker } from './jobs/softwareComplianceWorker';
 import { initializeSoftwareRemediationWorker, shutdownSoftwareRemediationWorker } from './jobs/softwareRemediationWorker';
 import { initializeAuditBaselineJobs, shutdownAuditBaselineJobs } from './jobs/auditBaselineJobs';
@@ -847,6 +849,10 @@ api.route('/monitoring', monitoringRoutes);
 api.route('/audit-baselines', auditBaselineRoutes);
 api.route('/software', softwareRoutes);
 api.route('/software-policies', softwarePoliciesRoutes);
+// Deeper mount first: isolates the platform-admin sync router from the main
+// router's org-scoped `.use('*')` middleware (same-prefix double-mount leaks).
+api.route('/vulnerabilities/sync', vulnerabilitySyncRoutes);
+api.route('/vulnerabilities', vulnerabilityRoutes);
 api.route('/system', systemRoutes);
 api.route('/system-tools', systemToolsRoutes);
 api.route('/notifications', notificationRoutes);
@@ -1113,6 +1119,7 @@ async function initializeWorkers(): Promise<void> {
     ['snmpRetention', initializeSnmpRetention],
     ['patchComplianceReportWorker', initializePatchComplianceReportWorker],
     ['cveEnrichmentWorker', initializeCveEnrichmentWorker],
+    ['vulnerabilityJobs', initializeVulnerabilityJobs],
     ['dnsSyncWorker', initializeDnsSyncJob],
     ['dnsThreatAlertSubscriber', async () => { registerDnsThreatAlertSubscriber(); }],
     ['s1SyncWorker', initializeS1SyncJob],
@@ -1263,6 +1270,7 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
     shutdownIncidentCorrelationWorker,
     shutdownPatchComplianceReportWorker,
     shutdownCveEnrichmentWorker,
+    shutdownVulnerabilityJobs,
     shutdownDnsSyncJob,
     shutdownS1SyncJob,
     shutdownHuntressSyncJob,

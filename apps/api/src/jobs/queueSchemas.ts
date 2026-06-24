@@ -263,6 +263,11 @@ export const recoveryBootMediaQueueJobDataSchema = z.object({
   meta: queueActorMetaSchema.optional(),
 }).strict();
 
+export const vulnSourceSyncSchema = z.object({
+  source: z.enum(['msrc', 'nvd', 'sofa', 'kev_epss']),
+  month: z.string().optional(),
+}).strict();
+
 export type BackupQueueJobData = z.infer<typeof backupQueueJobDataSchema>;
 export type DiscoveryQueueJobData = z.infer<typeof discoveryQueueJobDataSchema>;
 export type FdbEntry = z.infer<typeof fdbEntrySchema>;
@@ -273,6 +278,7 @@ export type SensitiveDataQueueJobData = z.infer<typeof sensitiveDataQueueJobData
 export type DrExecutionQueueJobData = z.infer<typeof drExecutionQueueJobDataSchema>;
 export type RecoveryMediaQueueJobData = z.infer<typeof recoveryMediaQueueJobDataSchema>;
 export type RecoveryBootMediaQueueJobData = z.infer<typeof recoveryBootMediaQueueJobDataSchema>;
+export type VulnSourceSyncJobData = z.infer<typeof vulnSourceSyncSchema>;
 export type QueueActorMeta = z.infer<typeof queueActorMetaSchema>;
 
 export function withQueueMeta<T extends Record<string, unknown>>(

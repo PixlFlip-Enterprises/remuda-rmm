@@ -74,6 +74,8 @@ const TARGET_GLOBS = [
   'src/components/billing/quotes/QuoteEditor.tsx',
   'src/components/alerts/CorrelatedAlertGroups.tsx',
   'src/components/integrations/SecurityIntegration.tsx',
+  'src/components/devices/DeviceVulnerabilitiesTab.tsx',
+  'src/lib/api/vulnerabilities.ts',
   'src/components/settings/TdSynnexEcExpressPanel.tsx',
 ];
 
@@ -266,7 +268,7 @@ describe('migration backlog integrity', () => {
 // ─── Main guard ─────────────────────────────────────────────────────────────
 describe('no silent mutations in targeted set', () => {
   it('finds files to scan', () => {
-    expect(absoluteFiles.length).toBe(47);
+    expect(absoluteFiles.length).toBe(49);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }
