@@ -210,7 +210,7 @@ vi.mock('../services/remoteSessionTeardown', () => ({
   TEARDOWN_FAILED: -1,
 }));
 
-import { db } from '../db';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { clearPermissionCache, getUserPermissions } from '../services/permissions';
 import { authMiddleware } from '../middleware/auth';
 import { revokeAllUserTokens } from '../services/tokenRevocation';
@@ -1936,6 +1936,127 @@ describe('user routes', () => {
         const bytes = Buffer.from(await res.arrayBuffer());
         expect(bytes.equals(PNG_BYTES)).toBe(true);
       });
+    });
+  });
+
+  // Regression: partner-wide user management must be gated on the caller's
+  // partnerUsers.orgAccess === 'all'. Inferring it from accessibleOrgIds (which
+  // is filtered to active/trial orgs, and narrowed by RLS when the org list is
+  // read under the request context) both false-denies legit full-access admins
+  // (any suspended/soft-deleted or zero orgs) and vacuously passes a
+  // 'selected'/'none' admin. orgAccess is the authoritative, status-independent
+  // signal.
+  describe('full partner access gate (orgAccess===all)', () => {
+    // The FIRST db.select() is the gate membership lookup (.from().where().limit());
+    // later selects belong to the GET /users handler — back them with [].
+    function seedMembership(orgAccess: 'all' | 'selected' | 'none' | null) {
+      const gateLimit = vi.fn(() => Promise.resolve(orgAccess === null ? [] : [{ orgAccess }]));
+      const gateWhere = vi.fn(() => ({ limit: gateLimit }));
+      const handlerWhere = vi.fn(() => Promise.resolve([]));
+      let firstCall = true;
+      vi.mocked(db.select).mockReset().mockImplementation(() => {
+        const isGate = firstCall;
+        firstCall = false;
+        return {
+          from: vi.fn(() => ({
+            where: isGate ? gateWhere : handlerWhere,
+            innerJoin: vi.fn(() => ({
+              innerJoin: vi.fn(() => ({ where: handlerWhere })),
+              where: handlerWhere,
+            })),
+          })),
+        } as any;
+      });
+    }
+
+    function authAsPartner() {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          orgId: null,
+          accessibleOrgIds: [],
+          user: { id: 'user-123', email: 'test@example.com' }
+        });
+        return next();
+      });
+    }
+
+    it("denies a 'selected' partner-admin (403)", async () => {
+      seedMembership('selected');
+      authAsPartner();
+
+      const res = await app.request('/users', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("denies a 'none' partner-admin (403)", async () => {
+      seedMembership('none');
+      authAsPartner();
+
+      const res = await app.request('/users', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('denies when no partner membership row resolves (403)', async () => {
+      seedMembership(null);
+      authAsPartner();
+
+      const res = await app.request('/users', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("allows an 'all' partner-admin regardless of suspended/zero active orgs (200)", async () => {
+      // orgAccess==='all' is authoritative — no false denial when the partner
+      // has suspended/soft-deleted orgs (or none yet), the bug the set-compare
+      // approach introduced.
+      seedMembership('all');
+      authAsPartner();
+
+      const res = await app.request('/users', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('exempts self-service GET /me from the management gate for non-all admins', async () => {
+      // A 'selected'/'none' partner admin (accessibleOrgIds IS an array, so the
+      // shape early-return does NOT fire) must still reach their own profile —
+      // the gate governs partner-wide MANAGEMENT only. Without the self-service
+      // exemption this route would 403 (regression the cross-org fix introduced).
+      authAsPartner();
+      const userRow = {
+        id: 'user-123', email: 'test@example.com', name: 'Test', avatarUrl: null,
+        status: 'active', mfaEnabled: false, isPlatformAdmin: false,
+        createdAt: new Date(), lastLoginAt: null, setupCompletedAt: new Date(),
+        passwordChangedAt: null, preferences: {},
+      };
+      // Gate must NOT issue a partnerUsers membership query for a self-service
+      // path; the only select is the /me user lookup.
+      vi.mocked(db.select).mockReset().mockReturnValue({
+        from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(() => Promise.resolve([userRow])) })) })),
+      } as any);
+
+      const res = await app.request('/users/me', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
     });
   });
 });

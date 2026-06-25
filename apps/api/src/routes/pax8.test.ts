@@ -1,14 +1,28 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
-const { permissionGate, authState } = vi.hoisted(() => ({
-  permissionGate: { deny: false },
-  authState: {
+const ORG_A = '22222222-2222-2222-2222-222222222222';
+const ORG_B = '55555555-5555-5555-5555-555555555555';
+
+const { permissionGate, authState, orgConditionSpy } = vi.hoisted(() => {
+  const authState = {
     canAccessOrg: true,
     partnerId: '11111111-1111-1111-1111-111111111111' as string | null,
     scope: 'partner' as 'partner' | 'organization' | 'system',
-  },
-}));
+    // null = system scope (no filter); string[] = partner/org scope accessible orgs
+    accessibleOrgIds: ['22222222-2222-2222-2222-222222222222'] as string[] | null,
+  };
+  // Single hoisted spy so tests can assert the org-filter branch actually fired
+  // (called with the snapshot orgId column) and what it produced (a filter for
+  // partner scope, undefined for system) — not just that `.where()` was called.
+  const orgConditionSpy = vi.fn((col: any) => {
+    const ids = authState.accessibleOrgIds;
+    if (ids === null) return undefined;
+    if (ids.length === 0) return `${col} = '00000000-0000-0000-0000-000000000000'`;
+    return `${col} IN (${ids.join(',')})`;
+  });
+  return { permissionGate: { deny: false }, authState, orgConditionSpy };
+});
 
 vi.mock('../db', () => ({
   db: {
@@ -89,12 +103,16 @@ vi.mock('../db/schema', () => ({
 
 vi.mock('../middleware/auth', () => ({
   authMiddleware: vi.fn((c: any, next: any) => {
+    const ids = authState.accessibleOrgIds;
     c.set('auth', {
       scope: authState.scope,
       partnerId: authState.partnerId,
-      orgId: authState.scope === 'organization' ? '22222222-2222-2222-2222-222222222222' : null,
-      accessibleOrgIds: ['22222222-2222-2222-2222-222222222222'],
+      orgId: authState.scope === 'organization' ? ORG_A : null,
+      accessibleOrgIds: ids,
       canAccessOrg: vi.fn(() => authState.canAccessOrg),
+      // Hoisted spy (impl mirrors middleware/auth.ts orgCondition) so tests can
+      // assert the org-filter branch fired and what it produced.
+      orgCondition: orgConditionSpy,
       user: { id: '33333333-3333-3333-3333-333333333333', email: 'admin@example.com' },
     });
     return next();
@@ -144,15 +162,60 @@ function mockSelectOnce(rows: unknown[]) {
   } as any);
 }
 
+/**
+ * Mock for the subscription snapshots query chain which uses
+ * .from().leftJoin().leftJoin().where().orderBy().limit()
+ * Returns a spy on `where` so tests can assert on the conditions passed in.
+ */
+function mockSubscriptionSelectOnce(integrationRows: unknown[], snapshotRows: unknown[]) {
+  let whereConditions: unknown;
+  const whereSpy = vi.fn((cond: unknown) => {
+    whereConditions = cond;
+    return {
+      orderBy: vi.fn(() => ({
+        limit: vi.fn(async () => snapshotRows),
+      })),
+    };
+  });
+
+  // First call: findActiveIntegration (simple from/where/limit chain)
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn(() => ({
+      where: vi.fn(() => ({
+        limit: vi.fn(async () => integrationRows),
+      })),
+    })),
+  } as any);
+
+  // Second call: the snapshot join query (from/leftJoin/leftJoin/where/orderBy/limit)
+  const leftJoinMock = vi.fn().mockReturnThis();
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn(() => ({
+      leftJoin: leftJoinMock.mockImplementation(() => ({
+        leftJoin: vi.fn(() => ({
+          where: whereSpy,
+        })),
+      })),
+    })),
+  } as any);
+
+  return { whereSpy, getConditions: () => whereConditions };
+}
+
 describe('pax8 routes', () => {
   let app: Hono;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // clearAllMocks does NOT drain mockReturnValueOnce queues — reset db.select so a
+    // leftover snapshot-select mock from an early-returning test (e.g. the 403
+    // canAccessOrg path) cannot bleed into the next test's findActiveIntegration call.
+    vi.mocked(db.select).mockReset();
     permissionGate.deny = false;
     authState.canAccessOrg = true;
     authState.partnerId = '11111111-1111-1111-1111-111111111111';
     authState.scope = 'partner';
+    authState.accessibleOrgIds = [ORG_A];
     app = new Hono();
     app.route('/pax8', pax8Routes);
   });
@@ -305,5 +368,59 @@ describe('pax8 routes', () => {
     });
 
     expect(res.status).toBe(404);
+  });
+
+  // -------------------------------------------------------------------------
+  // GET /pax8/subscriptions — org-filter tests (cross-org billing leak fix)
+  // -------------------------------------------------------------------------
+
+  it('GET /subscriptions without orgId applies orgCondition filter for partner callers', async () => {
+    // accessibleOrgIds = [ORG_A] (set in beforeEach)
+    const integration = { id: '44444444-4444-4444-4444-444444444444', partnerId: authState.partnerId, name: 'Pax8', apiBaseUrl: 'https://api.pax8.com', tokenUrl: 'https://login.pax8.com', isActive: true, lastSyncAt: null, lastSyncStatus: null, lastSyncError: null, createdAt: new Date(), updatedAt: new Date() };
+    const { whereSpy } = mockSubscriptionSelectOnce([integration], []);
+
+    const res = await app.request('/pax8/subscriptions', { method: 'GET' });
+
+    expect(res.status).toBe(200);
+    expect(whereSpy).toHaveBeenCalled();
+    // Non-vacuous: the org-filter branch must FIRE for a partner caller with no
+    // orgId — orgCondition is invoked on the snapshot orgId column and returns a
+    // truthy filter the route pushes into the WHERE. If that branch were removed
+    // (the cross-org leak), orgCondition would not be called with this column.
+    expect(orgConditionSpy).toHaveBeenCalledWith('pax8_subscription_snapshots.org_id');
+    expect(orgConditionSpy).toHaveReturnedWith(`pax8_subscription_snapshots.org_id IN (${ORG_A})`);
+    const body = await res.json();
+    expect(body).toHaveProperty('integrationId', integration.id);
+  });
+
+  it('GET /subscriptions with inaccessible orgId returns 403', async () => {
+    authState.canAccessOrg = false;
+    mockSubscriptionSelectOnce([{ id: '44444444-4444-4444-4444-444444444444', partnerId: authState.partnerId, name: 'Pax8', apiBaseUrl: 'https://api.pax8.com', tokenUrl: 'https://login.pax8.com', isActive: true, lastSyncAt: null, lastSyncStatus: null, lastSyncError: null, createdAt: new Date(), updatedAt: new Date() }], []);
+
+    const res = await app.request(`/pax8/subscriptions?orgId=${ORG_B}`, { method: 'GET' });
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toMatchObject({ error: 'Access to organization denied' });
+  });
+
+  it('GET /subscriptions without orgId applies no extra filter for system-scope callers', async () => {
+    authState.scope = 'system';
+    authState.partnerId = null;
+    authState.accessibleOrgIds = null; // system scope: null = see all
+
+    const integration = { id: '44444444-4444-4444-4444-444444444444', partnerId: '11111111-1111-1111-1111-111111111111', name: 'Pax8', apiBaseUrl: 'https://api.pax8.com', tokenUrl: 'https://login.pax8.com', isActive: true, lastSyncAt: null, lastSyncStatus: null, lastSyncError: null, createdAt: new Date(), updatedAt: new Date() };
+    // System scope caller must supply partnerId; supply it in query to pass resolvePartnerId
+    const { whereSpy } = mockSubscriptionSelectOnce([integration], [{ id: 'snap-1', orgId: ORG_A }, { id: 'snap-2', orgId: ORG_B }]);
+
+    const res = await app.request('/pax8/subscriptions?partnerId=11111111-1111-1111-1111-111111111111', { method: 'GET' });
+
+    expect(res.status).toBe(200);
+    expect(whereSpy).toHaveBeenCalled();
+    // System scope: the branch still runs but orgCondition returns undefined, so
+    // NO org filter is pushed and all rows are visible (operators see everything).
+    expect(orgConditionSpy).toHaveBeenCalledWith('pax8_subscription_snapshots.org_id');
+    expect(orgConditionSpy).toHaveReturnedWith(undefined);
+    const body = await res.json();
+    expect(body.data).toHaveLength(2);
   });
 });

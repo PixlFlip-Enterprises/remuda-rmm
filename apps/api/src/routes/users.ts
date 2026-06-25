@@ -47,6 +47,20 @@ userRoutes.use('*', async (c, next) => {
     return;
   }
 
+  // Self-service routes (own profile + own/displayed avatar) must stay accessible
+  // to EVERY partner user regardless of org-access level. This gate governs
+  // partner-wide user MANAGEMENT only — without this exemption a 'selected'/'none'
+  // partner admin would be 403'd on GET/PATCH /me and the top-bar avatar
+  // (GET /:id/avatar runs its own scope check in the handler).
+  const path = c.req.path;
+  const isSelfServiceRoute =
+    /\/me(\/avatar)?$/.test(path) ||
+    (c.req.method === 'GET' && /\/avatar$/.test(path));
+  if (isSelfServiceRoute) {
+    await next();
+    return;
+  }
+
   if (!auth.partnerId) {
     throw new HTTPException(403, { message: 'Partner context required' });
   }
@@ -55,15 +69,28 @@ userRoutes.use('*', async (c, next) => {
     await next();
     return;
   }
-  const accessibleOrgIds = auth.accessibleOrgIds;
 
-  const partnerOrgRows = await db
-    .select({ id: organizations.id })
-    .from(organizations)
-    .where(eq(organizations.partnerId, auth.partnerId));
-  const hasFullPartnerAccess = partnerOrgRows.every((org) => accessibleOrgIds.includes(org.id));
+  // Partner-wide user management requires a FULL-access partner membership.
+  // Gate directly on partnerUsers.orgAccess === 'all' — the same field the
+  // middleware uses to compute accessibleOrgIds (auth.ts). Do NOT infer this by
+  // comparing accessibleOrgIds against the partner's org list: accessibleOrgIds
+  // is filtered to active/trial, non-deleted orgs, so a full-access admin of a
+  // partner that has any suspended/soft-deleted org (or zero orgs yet) would be
+  // false-denied, while the org-list read under request RLS is itself narrowed
+  // (the RLS-vacuous trap). orgAccess is the authoritative, status-independent
+  // signal that distinguishes 'all' from the 'selected'/'none' escalation case.
+  const [membership] = await db
+    .select({ orgAccess: partnerUsers.orgAccess })
+    .from(partnerUsers)
+    .where(
+      and(
+        eq(partnerUsers.userId, auth.user.id),
+        eq(partnerUsers.partnerId, auth.partnerId)
+      )
+    )
+    .limit(1);
 
-  if (!hasFullPartnerAccess) {
+  if (membership?.orgAccess !== 'all') {
     throw new HTTPException(403, { message: 'Full partner organization access required' });
   }
 
