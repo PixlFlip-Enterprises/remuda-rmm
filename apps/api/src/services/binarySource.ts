@@ -91,6 +91,17 @@ export function getGithubWatchdogUrl(os: string, arch: string): string {
   return `${githubDownloadBase()}/${filename}`;
 }
 
+// breeze-user-helper is the GUI-subsystem sibling of breeze-agent. The agent
+// only prefetches it on Windows today, but this mirrors the other per-(os,arch)
+// asset URL helpers and stays OS-general. It is a distinct release asset from
+// the Tauri "helper" app served by HELPER_FILENAMES — don't conflate the two
+// (#1878).
+export function getGithubUserHelperUrl(os: string, arch: string): string {
+  const extension = os === 'windows' ? '.exe' : '';
+  const filename = `breeze-user-helper-${os}-${arch}${extension}`;
+  return `${githubDownloadBase()}/${filename}`;
+}
+
 export function getGithubRegularMsiUrl(): string {
   return `${githubDownloadBase()}/breeze-agent.msi`;
 }
